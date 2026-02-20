@@ -74,13 +74,8 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Explain
         let migration = resolved.iter().find(|m| m.script == info.script);
         let sql = match migration {
             Some(m) => {
-                let placeholders = build_placeholders(
-                    &config.placeholders,
-                    schema,
-                    &db_user,
-                    &db_name,
-                    &m.script,
-                );
+                let placeholders =
+                    build_placeholders(&config.placeholders, schema, &db_user, &db_name, &m.script);
                 replace_placeholders(&m.sql, &placeholders)?
             }
             None => continue,
@@ -132,10 +127,8 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Explain
                 let explain_sql = format!("EXPLAIN (FORMAT TEXT) {}", trimmed);
                 match client.query(&explain_sql, &[]).await {
                     Ok(rows_result) => {
-                        let plan_lines: Vec<String> = rows_result
-                            .iter()
-                            .map(|r| r.get::<_, String>(0))
-                            .collect();
+                        let plan_lines: Vec<String> =
+                            rows_result.iter().map(|r| r.get::<_, String>(0)).collect();
                         let plan_str = plan_lines.join("\n");
 
                         let (rows, cost, warnings) = extract_plan_info_text(&plan_str);
@@ -199,7 +192,9 @@ fn extract_plan_info_text(plan_text: &str) -> (Option<f64>, Option<f64>, Vec<Str
         }
         if let Some(rows_start) = trimmed.find("rows=") {
             let rest = &trimmed[rows_start + 5..];
-            let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
             if let Ok(rows) = rest[..end].parse::<f64>() {
                 if total_rows.is_none() {
                     total_rows = Some(rows);

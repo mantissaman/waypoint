@@ -38,14 +38,14 @@ impl DependencyGraph {
 
         for m in &versioned {
             let version = m.version().unwrap().raw.clone();
-            all_versions.push(version.clone());
             edges.entry(version.clone()).or_default();
             reverse_edges.entry(version.clone()).or_default();
+            all_versions.push(version);
         }
 
         // Add explicit dependencies from directives
         for m in &versioned {
-            let version = m.version().unwrap().raw.clone();
+            let version = &m.version().unwrap().raw;
             for dep in &m.directives.depends {
                 if !edges.contains_key(dep) {
                     return Err(WaypointError::MissingDependency {
@@ -53,8 +53,11 @@ impl DependencyGraph {
                         dependency: dep.clone(),
                     });
                 }
-                edges.get_mut(&version).unwrap().insert(dep.clone());
-                reverse_edges.get_mut(dep).unwrap().insert(version.clone());
+                edges.get_mut(version.as_str()).unwrap().insert(dep.clone());
+                reverse_edges
+                    .get_mut(dep.as_str())
+                    .unwrap()
+                    .insert(version.clone());
             }
         }
 
@@ -65,10 +68,7 @@ impl DependencyGraph {
                 let previous = &all_versions[i - 1];
                 // Only add implicit dependency if no explicit dependencies are set
                 if edges.get(current).is_none_or(|deps| deps.is_empty()) {
-                    edges
-                        .get_mut(current)
-                        .unwrap()
-                        .insert(previous.clone());
+                    edges.get_mut(current).unwrap().insert(previous.clone());
                     reverse_edges
                         .get_mut(previous)
                         .unwrap()
@@ -86,53 +86,105 @@ impl DependencyGraph {
 
     /// Produce a topologically sorted order of versions using Kahn's algorithm.
     ///
-    /// Returns an error if there is a cycle.
+    /// Uses borrowed `&str` references internally to avoid cloning during
+    /// the sort; only clones into owned `String`s for the output.
     pub fn topological_sort(&self) -> Result<Vec<String>> {
-        // Compute in-degree for each node
-        let mut in_degree: HashMap<String, usize> = HashMap::new();
+        // Compute in-degree for each node using borrowed keys
+        let mut in_degree: HashMap<&str, usize> = HashMap::new();
         for v in &self.all_versions {
-            in_degree.insert(v.clone(), self.edges.get(v).map_or(0, |deps| deps.len()));
+            in_degree.insert(v, self.edges.get(v).map_or(0, |deps| deps.len()));
         }
 
         // Start with nodes that have no dependencies
-        let mut queue: VecDeque<String> = VecDeque::new();
+        let mut queue: VecDeque<&str> = VecDeque::new();
         for v in &self.all_versions {
-            if *in_degree.get(v).unwrap_or(&0) == 0 {
-                queue.push_back(v.clone());
+            if *in_degree.get(v.as_str()).unwrap_or(&0) == 0 {
+                queue.push_back(v);
             }
         }
 
         let mut sorted = Vec::new();
 
         while let Some(node) = queue.pop_front() {
-            sorted.push(node.clone());
+            sorted.push(node.to_string());
 
             // For each node that depends on this one, decrement in-degree
-            if let Some(dependents) = self.reverse_edges.get(&node) {
+            if let Some(dependents) = self.reverse_edges.get(node) {
                 for dep in dependents {
-                    let deg = in_degree.get_mut(dep).unwrap();
+                    let deg = in_degree.get_mut(dep.as_str()).unwrap();
                     *deg -= 1;
                     if *deg == 0 {
-                        queue.push_back(dep.clone());
+                        queue.push_back(dep);
                     }
                 }
             }
         }
 
         if sorted.len() != self.all_versions.len() {
-            // Find the cycle for error reporting
-            let in_cycle: Vec<String> = self
-                .all_versions
+            // Trace an actual cycle path — convert in_degree to owned keys for trace_cycle
+            let owned_in_degree: HashMap<String, usize> = in_degree
                 .iter()
-                .filter(|v| *in_degree.get(*v).unwrap_or(&0) > 0)
-                .cloned()
+                .map(|(&k, &v)| (k.to_string(), v))
                 .collect();
-            return Err(WaypointError::DependencyCycle {
-                path: in_cycle.join(" -> "),
-            });
+            let cycle_path = self.trace_cycle(&owned_in_degree);
+            return Err(WaypointError::DependencyCycle { path: cycle_path });
         }
 
         Ok(sorted)
+    }
+
+    /// Trace an actual cycle path for error reporting.
+    fn trace_cycle(&self, in_degree: &HashMap<String, usize>) -> String {
+        // Start from any node still in the cycle
+        let start = self
+            .all_versions
+            .iter()
+            .find(|v| *in_degree.get(*v).unwrap_or(&0) > 0);
+
+        let Some(start) = start else {
+            return "unknown cycle".to_string();
+        };
+
+        // Follow dependency edges to trace the cycle
+        let mut path = vec![start.clone()];
+        let mut current = start.clone();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(current.clone());
+
+        loop {
+            // Find a dependency of `current` that is also in the cycle
+            let next = self
+                .edges
+                .get(&current)
+                .and_then(|deps| deps.iter().find(|d| *in_degree.get(*d).unwrap_or(&0) > 0));
+
+            match next {
+                Some(n) => {
+                    if !visited.insert(n.clone()) {
+                        // We've come back to a visited node — complete the cycle
+                        path.push(n.clone());
+                        // Trim path to start from the cycle entry point
+                        if let Some(pos) = path.iter().position(|v| v == n) {
+                            let cycle: Vec<String> = path[pos..].to_vec();
+                            return cycle.join(" -> ");
+                        }
+                        return path.join(" -> ");
+                    }
+                    path.push(n.clone());
+                    current = n.clone();
+                }
+                None => {
+                    // Fallback: list all nodes in cycle
+                    let in_cycle: Vec<String> = self
+                        .all_versions
+                        .iter()
+                        .filter(|v| *in_degree.get(*v).unwrap_or(&0) > 0)
+                        .cloned()
+                        .collect();
+                    return format!("cycle involving: {}", in_cycle.join(", "));
+                }
+            }
+        }
     }
 }
 
@@ -152,6 +204,7 @@ mod tests {
             directives: MigrationDirectives {
                 depends: depends.into_iter().map(String::from).collect(),
                 env: vec![],
+                ..Default::default()
             },
         }
     }
@@ -199,5 +252,61 @@ mod tests {
         let migrations: Vec<&ResolvedMigration> = vec![&m1];
 
         assert!(DependencyGraph::build(&migrations, false).is_err());
+    }
+
+    #[test]
+    fn test_cycle_error_shows_path() {
+        let m1 = make_migration("1", vec!["3"]);
+        let m2 = make_migration("2", vec!["1"]);
+        let m3 = make_migration("3", vec!["2"]);
+        let migrations: Vec<&ResolvedMigration> = vec![&m1, &m2, &m3];
+
+        let graph = DependencyGraph::build(&migrations, false).unwrap();
+        let err = graph.topological_sort().unwrap_err();
+        let msg = err.to_string();
+        // The error should contain cycle path information
+        assert!(msg.contains("->"), "Cycle error should show path: {}", msg);
+    }
+
+    #[test]
+    fn test_empty_migrations() {
+        let migrations: Vec<&ResolvedMigration> = vec![];
+        let graph = DependencyGraph::build(&migrations, true).unwrap();
+        let order = graph.topological_sort().unwrap();
+        assert!(order.is_empty());
+    }
+
+    #[test]
+    fn test_single_migration() {
+        let m1 = make_migration("1", vec![]);
+        let migrations: Vec<&ResolvedMigration> = vec![&m1];
+        let graph = DependencyGraph::build(&migrations, true).unwrap();
+        let order = graph.topological_sort().unwrap();
+        assert_eq!(order, vec!["1"]);
+    }
+
+    #[test]
+    fn test_diamond_dependency() {
+        let m1 = make_migration("1", vec![]);
+        let m2 = make_migration("2", vec!["1"]);
+        let m3 = make_migration("3", vec!["1"]);
+        let m4 = make_migration("4", vec!["2", "3"]);
+        let migrations: Vec<&ResolvedMigration> = vec![&m1, &m2, &m3, &m4];
+
+        let graph = DependencyGraph::build(&migrations, false).unwrap();
+        let order = graph.topological_sort().unwrap();
+
+        // V1 must be first, V4 must be last
+        assert_eq!(order[0], "1");
+        assert_eq!(order[3], "4");
+    }
+
+    #[test]
+    fn test_self_referencing_cycle() {
+        let m1 = make_migration("1", vec!["1"]);
+        let migrations: Vec<&ResolvedMigration> = vec![&m1];
+
+        let graph = DependencyGraph::build(&migrations, false).unwrap();
+        assert!(graph.topological_sort().is_err());
     }
 }

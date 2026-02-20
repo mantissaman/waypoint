@@ -6,6 +6,7 @@ use serde::Serialize;
 use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;
+use crate::db;
 use crate::error::Result;
 use crate::history;
 use crate::migration::{scan_migrations, ResolvedMigration};
@@ -29,6 +30,25 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<RepairR
     let schema = &config.migrations.schema;
     let table = &config.migrations.table;
 
+    // Acquire advisory lock to prevent concurrent operations
+    db::acquire_advisory_lock(client, table).await?;
+
+    let result = execute_inner(client, config, schema, table).await;
+
+    // Always release the lock
+    if let Err(e) = db::release_advisory_lock(client, table).await {
+        log::error!("Failed to release advisory lock: {}", e);
+    }
+
+    result
+}
+
+async fn execute_inner(
+    client: &Client,
+    config: &WaypointConfig,
+    schema: &str,
+    table: &str,
+) -> Result<RepairReport> {
     // Ensure history table exists
     history::create_history_table(client, schema, table).await?;
 
@@ -63,7 +83,6 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<RepairR
             continue;
         }
 
-        // Distinguish by version presence for Flyway compatibility
         if let Some(ref version) = am.version {
             if let Some(resolved) = resolved_by_version.get(version) {
                 if am.checksum != Some(resolved.checksum) {
@@ -99,7 +118,11 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<RepairR
         }
     }
 
-    log::info!("Repair completed; failed_removed={}, checksums_updated={}", failed_removed, checksums_updated);
+    log::info!(
+        "Repair completed; failed_removed={}, checksums_updated={}",
+        failed_removed,
+        checksums_updated
+    );
 
     Ok(RepairReport {
         failed_removed,

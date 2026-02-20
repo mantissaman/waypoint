@@ -11,6 +11,50 @@ use serde::Deserialize;
 
 use crate::error::{Result, WaypointError};
 
+/// Helper macro to apply an optional owned value directly to a target field.
+///
+/// Replaces: `if let Some(v) = $opt { $target = v; }`
+macro_rules! apply_option {
+    ($opt:expr => $target:expr) => {
+        if let Some(v) = $opt {
+            $target = v;
+        }
+    };
+}
+
+/// Helper macro to apply an optional owned value, wrapping it in `Some()`.
+///
+/// Replaces: `if let Some(v) = $opt { $target = Some(v); }`
+macro_rules! apply_option_some {
+    ($opt:expr => $target:expr) => {
+        if let Some(v) = $opt {
+            $target = Some(v);
+        }
+    };
+}
+
+/// Helper macro to clone a borrowed optional value directly to a target field.
+///
+/// Replaces: `if let Some(ref v) = $opt { $target = v.clone(); }`
+macro_rules! apply_option_clone {
+    ($opt:expr => $target:expr) => {
+        if let Some(ref v) = $opt {
+            $target = v.clone();
+        }
+    };
+}
+
+/// Helper macro to clone a borrowed optional value, wrapping it in `Some()`.
+///
+/// Replaces: `if let Some(ref v) = $opt { $target = Some(v.clone()); }`
+macro_rules! apply_option_some_clone {
+    ($opt:expr => $target:expr) => {
+        if let Some(ref v) = $opt {
+            $target = Some(v.clone());
+        }
+    };
+}
+
 /// SSL/TLS connection mode.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SslMode {
@@ -58,6 +102,16 @@ pub struct WaypointConfig {
     pub preflight: crate::preflight::PreflightConfig,
     /// Optional multi-database configuration for parallel migration targets.
     pub multi_database: Option<Vec<crate::multi::NamedDatabaseConfig>>,
+    /// Guard (pre/post condition) configuration.
+    pub guards: crate::guard::GuardsConfig,
+    /// Auto-reversal generation configuration.
+    pub reversals: crate::reversal::ReversalConfig,
+    /// Safety analysis configuration.
+    pub safety: crate::safety::SafetyConfig,
+    /// Schema advisor configuration.
+    pub advisor: crate::advisor::AdvisorConfig,
+    /// Migration simulation configuration.
+    pub simulation: SimulationConfig,
 }
 
 /// Database connection configuration.
@@ -83,6 +137,8 @@ pub struct DatabaseConfig {
     pub connect_timeout_secs: u32,
     /// Statement timeout in seconds (0 means no timeout).
     pub statement_timeout_secs: u32,
+    /// TCP keepalive interval in seconds (0 disables, default 120).
+    pub keepalive_secs: u32,
 }
 
 impl Default for DatabaseConfig {
@@ -98,6 +154,7 @@ impl Default for DatabaseConfig {
             ssl_mode: SslMode::Prefer,
             connect_timeout_secs: 30,
             statement_timeout_secs: 0,
+            keepalive_secs: 120,
         }
     }
 }
@@ -115,6 +172,7 @@ impl fmt::Debug for DatabaseConfig {
             .field("ssl_mode", &self.ssl_mode)
             .field("connect_timeout_secs", &self.connect_timeout_secs)
             .field("statement_timeout_secs", &self.statement_timeout_secs)
+            .field("keepalive_secs", &self.keepalive_secs)
             .finish()
     }
 }
@@ -164,6 +222,8 @@ pub struct MigrationSettings {
     pub dependency_ordering: bool,
     /// Whether to display a progress indicator during migration.
     pub show_progress: bool,
+    /// Whether to wrap all pending migrations in a single transaction (all-or-nothing).
+    pub batch_transaction: bool,
 }
 
 impl Default for MigrationSettings {
@@ -180,8 +240,16 @@ impl Default for MigrationSettings {
             environment: None,
             dependency_ordering: false,
             show_progress: true,
+            batch_transaction: false,
         }
     }
+}
+
+/// Migration simulation configuration.
+#[derive(Debug, Clone, Default)]
+pub struct SimulationConfig {
+    /// Whether to run simulation before migrate.
+    pub simulate_before_migrate: bool,
 }
 
 // ── TOML deserialization structs ──
@@ -196,6 +264,11 @@ struct TomlConfig {
     snapshots: Option<TomlSnapshotConfig>,
     preflight: Option<TomlPreflightConfig>,
     databases: Option<Vec<TomlNamedDatabaseConfig>>,
+    guards: Option<TomlGuardsConfig>,
+    reversals: Option<TomlReversalConfig>,
+    safety: Option<TomlSafetyConfig>,
+    advisor: Option<TomlAdvisorConfig>,
+    simulation: Option<TomlSimulationConfig>,
 }
 
 #[derive(Deserialize, Default)]
@@ -210,6 +283,7 @@ struct TomlDatabaseConfig {
     ssl_mode: Option<String>,
     connect_timeout: Option<u32>,
     statement_timeout: Option<u32>,
+    keepalive: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -225,6 +299,7 @@ struct TomlMigrationSettings {
     environment: Option<String>,
     dependency_ordering: Option<bool>,
     show_progress: Option<bool>,
+    batch_transaction: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -264,6 +339,36 @@ struct TomlHooksConfig {
     after_each_migrate: Option<Vec<String>>,
 }
 
+#[derive(Deserialize, Default)]
+struct TomlGuardsConfig {
+    on_require_fail: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlReversalConfig {
+    enabled: Option<bool>,
+    warn_data_loss: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlSafetyConfig {
+    enabled: Option<bool>,
+    block_on_danger: Option<bool>,
+    large_table_threshold: Option<i64>,
+    huge_table_threshold: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlAdvisorConfig {
+    run_after_migrate: Option<bool>,
+    disabled_rules: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlSimulationConfig {
+    simulate_before_migrate: Option<bool>,
+}
+
 /// CLI overrides that take highest priority.
 #[derive(Debug, Default, Clone)]
 pub struct CliOverrides {
@@ -293,6 +398,10 @@ pub struct CliOverrides {
     pub environment: Option<String>,
     /// Override whether to use dependency-based migration ordering.
     pub dependency_ordering: Option<bool>,
+    /// Override TCP keepalive interval in seconds.
+    pub keepalive: Option<u32>,
+    /// Override batch transaction mode (all-or-nothing).
+    pub batch_transaction: Option<bool>,
 }
 
 impl WaypointConfig {
@@ -354,74 +463,42 @@ impl WaypointConfig {
 
     fn apply_toml(&mut self, toml: TomlConfig) {
         if let Some(db) = toml.database {
-            if let Some(v) = db.url {
-                self.database.url = Some(v);
-            }
-            if let Some(v) = db.host {
-                self.database.host = Some(v);
-            }
-            if let Some(v) = db.port {
-                self.database.port = Some(v);
-            }
-            if let Some(v) = db.user {
-                self.database.user = Some(v);
-            }
-            if let Some(v) = db.password {
-                self.database.password = Some(v);
-            }
-            if let Some(v) = db.database {
-                self.database.database = Some(v);
-            }
-            if let Some(v) = db.connect_retries {
-                self.database.connect_retries = v;
-            }
+            apply_option_some!(db.url => self.database.url);
+            apply_option_some!(db.host => self.database.host);
+            apply_option_some!(db.port => self.database.port);
+            apply_option_some!(db.user => self.database.user);
+            apply_option_some!(db.password => self.database.password);
+            apply_option_some!(db.database => self.database.database);
+            apply_option!(db.connect_retries => self.database.connect_retries);
             if let Some(v) = db.ssl_mode {
-                if let Ok(mode) = v.parse() {
-                    self.database.ssl_mode = mode;
+                match v.parse() {
+                    Ok(mode) => self.database.ssl_mode = mode,
+                    Err(_) => log::warn!(
+                        "Invalid ssl_mode '{}' in config, using default 'prefer'. Valid values: disable, prefer, require",
+                        v
+                    ),
                 }
             }
-            if let Some(v) = db.connect_timeout {
-                self.database.connect_timeout_secs = v;
-            }
-            if let Some(v) = db.statement_timeout {
-                self.database.statement_timeout_secs = v;
-            }
+            apply_option!(db.connect_timeout => self.database.connect_timeout_secs);
+            apply_option!(db.statement_timeout => self.database.statement_timeout_secs);
+            apply_option!(db.keepalive => self.database.keepalive_secs);
         }
 
         if let Some(m) = toml.migrations {
             if let Some(v) = m.locations {
                 self.migrations.locations = v.into_iter().map(|s| normalize_location(&s)).collect();
             }
-            if let Some(v) = m.table {
-                self.migrations.table = v;
-            }
-            if let Some(v) = m.schema {
-                self.migrations.schema = v;
-            }
-            if let Some(v) = m.out_of_order {
-                self.migrations.out_of_order = v;
-            }
-            if let Some(v) = m.validate_on_migrate {
-                self.migrations.validate_on_migrate = v;
-            }
-            if let Some(v) = m.clean_enabled {
-                self.migrations.clean_enabled = v;
-            }
-            if let Some(v) = m.baseline_version {
-                self.migrations.baseline_version = v;
-            }
-            if let Some(v) = m.installed_by {
-                self.migrations.installed_by = Some(v);
-            }
-            if let Some(v) = m.environment {
-                self.migrations.environment = Some(v);
-            }
-            if let Some(v) = m.dependency_ordering {
-                self.migrations.dependency_ordering = v;
-            }
-            if let Some(v) = m.show_progress {
-                self.migrations.show_progress = v;
-            }
+            apply_option!(m.table => self.migrations.table);
+            apply_option!(m.schema => self.migrations.schema);
+            apply_option!(m.out_of_order => self.migrations.out_of_order);
+            apply_option!(m.validate_on_migrate => self.migrations.validate_on_migrate);
+            apply_option!(m.clean_enabled => self.migrations.clean_enabled);
+            apply_option!(m.baseline_version => self.migrations.baseline_version);
+            apply_option_some!(m.installed_by => self.migrations.installed_by);
+            apply_option_some!(m.environment => self.migrations.environment);
+            apply_option!(m.dependency_ordering => self.migrations.dependency_ordering);
+            apply_option!(m.show_progress => self.migrations.show_progress);
+            apply_option!(m.batch_transaction => self.migrations.batch_transaction);
         }
 
         if let Some(h) = toml.hooks {
@@ -444,33 +521,54 @@ impl WaypointConfig {
         }
 
         if let Some(l) = toml.lint {
-            if let Some(v) = l.disabled_rules {
-                self.lint.disabled_rules = v;
-            }
+            apply_option!(l.disabled_rules => self.lint.disabled_rules);
         }
 
         if let Some(s) = toml.snapshots {
             if let Some(v) = s.directory {
                 self.snapshots.directory = PathBuf::from(v);
             }
-            if let Some(v) = s.auto_snapshot_on_migrate {
-                self.snapshots.auto_snapshot_on_migrate = v;
-            }
-            if let Some(v) = s.max_snapshots {
-                self.snapshots.max_snapshots = v;
-            }
+            apply_option!(s.auto_snapshot_on_migrate => self.snapshots.auto_snapshot_on_migrate);
+            apply_option!(s.max_snapshots => self.snapshots.max_snapshots);
         }
 
         if let Some(p) = toml.preflight {
-            if let Some(v) = p.enabled {
-                self.preflight.enabled = v;
+            apply_option!(p.enabled => self.preflight.enabled);
+            apply_option!(p.max_replication_lag_mb => self.preflight.max_replication_lag_mb);
+            apply_option!(p.long_query_threshold_secs => self.preflight.long_query_threshold_secs);
+        }
+
+        if let Some(g) = toml.guards {
+            if let Some(v) = g.on_require_fail {
+                match v.parse() {
+                    Ok(policy) => self.guards.on_require_fail = policy,
+                    Err(_) => log::warn!(
+                        "Invalid on_require_fail '{}' in config, using default 'error'. Valid values: error, warn, skip",
+                        v
+                    ),
+                }
             }
-            if let Some(v) = p.max_replication_lag_mb {
-                self.preflight.max_replication_lag_mb = v;
-            }
-            if let Some(v) = p.long_query_threshold_secs {
-                self.preflight.long_query_threshold_secs = v;
-            }
+        }
+
+        if let Some(r) = toml.reversals {
+            apply_option!(r.enabled => self.reversals.enabled);
+            apply_option!(r.warn_data_loss => self.reversals.warn_data_loss);
+        }
+
+        if let Some(s) = toml.safety {
+            apply_option!(s.enabled => self.safety.enabled);
+            apply_option!(s.block_on_danger => self.safety.block_on_danger);
+            apply_option!(s.large_table_threshold => self.safety.large_table_threshold);
+            apply_option!(s.huge_table_threshold => self.safety.huge_table_threshold);
+        }
+
+        if let Some(a) = toml.advisor {
+            apply_option!(a.run_after_migrate => self.advisor.run_after_migrate);
+            apply_option!(a.disabled_rules => self.advisor.disabled_rules);
+        }
+
+        if let Some(s) = toml.simulation {
+            apply_option!(s.simulate_before_migrate => self.simulation.simulate_before_migrate);
         }
 
         if let Some(databases) = toml.databases {
@@ -478,9 +576,7 @@ impl WaypointConfig {
             for db in databases {
                 let name = db.name.unwrap_or_default();
                 let mut db_config = DatabaseConfig::default();
-                if let Some(url) = db.url {
-                    db_config.url = Some(url);
-                }
+                apply_option_some!(db.url => db_config.url);
                 // Check for per-database env var
                 let env_url_key = format!("WAYPOINT_DB_{}_URL", name.to_uppercase());
                 if let Ok(url) = std::env::var(&env_url_key) {
@@ -490,26 +586,38 @@ impl WaypointConfig {
                 let mut mig_settings = MigrationSettings::default();
                 if let Some(m) = db.migrations {
                     if let Some(v) = m.locations {
-                        mig_settings.locations = v.into_iter().map(|s| normalize_location(&s)).collect();
+                        mig_settings.locations =
+                            v.into_iter().map(|s| normalize_location(&s)).collect();
                     }
-                    if let Some(v) = m.table { mig_settings.table = v; }
-                    if let Some(v) = m.schema { mig_settings.schema = v; }
-                    if let Some(v) = m.out_of_order { mig_settings.out_of_order = v; }
-                    if let Some(v) = m.validate_on_migrate { mig_settings.validate_on_migrate = v; }
-                    if let Some(v) = m.clean_enabled { mig_settings.clean_enabled = v; }
-                    if let Some(v) = m.baseline_version { mig_settings.baseline_version = v; }
-                    if let Some(v) = m.installed_by { mig_settings.installed_by = Some(v); }
-                    if let Some(v) = m.environment { mig_settings.environment = Some(v); }
-                    if let Some(v) = m.dependency_ordering { mig_settings.dependency_ordering = v; }
-                    if let Some(v) = m.show_progress { mig_settings.show_progress = v; }
+                    apply_option!(m.table => mig_settings.table);
+                    apply_option!(m.schema => mig_settings.schema);
+                    apply_option!(m.out_of_order => mig_settings.out_of_order);
+                    apply_option!(m.validate_on_migrate => mig_settings.validate_on_migrate);
+                    apply_option!(m.clean_enabled => mig_settings.clean_enabled);
+                    apply_option!(m.baseline_version => mig_settings.baseline_version);
+                    apply_option_some!(m.installed_by => mig_settings.installed_by);
+                    apply_option_some!(m.environment => mig_settings.environment);
+                    apply_option!(m.dependency_ordering => mig_settings.dependency_ordering);
+                    apply_option!(m.show_progress => mig_settings.show_progress);
+                    apply_option!(m.batch_transaction => mig_settings.batch_transaction);
                 }
 
                 let mut hooks_config = HooksConfig::default();
                 if let Some(h) = db.hooks {
-                    if let Some(v) = h.before_migrate { hooks_config.before_migrate = v.into_iter().map(PathBuf::from).collect(); }
-                    if let Some(v) = h.after_migrate { hooks_config.after_migrate = v.into_iter().map(PathBuf::from).collect(); }
-                    if let Some(v) = h.before_each_migrate { hooks_config.before_each_migrate = v.into_iter().map(PathBuf::from).collect(); }
-                    if let Some(v) = h.after_each_migrate { hooks_config.after_each_migrate = v.into_iter().map(PathBuf::from).collect(); }
+                    if let Some(v) = h.before_migrate {
+                        hooks_config.before_migrate = v.into_iter().map(PathBuf::from).collect();
+                    }
+                    if let Some(v) = h.after_migrate {
+                        hooks_config.after_migrate = v.into_iter().map(PathBuf::from).collect();
+                    }
+                    if let Some(v) = h.before_each_migrate {
+                        hooks_config.before_each_migrate =
+                            v.into_iter().map(PathBuf::from).collect();
+                    }
+                    if let Some(v) = h.after_each_migrate {
+                        hooks_config.after_each_migrate =
+                            v.into_iter().map(PathBuf::from).collect();
+                    }
                 }
 
                 named_dbs.push(crate::multi::NamedDatabaseConfig {
@@ -577,6 +685,14 @@ impl WaypointConfig {
             self.migrations.schema = v;
         }
 
+        if let Ok(v) = std::env::var("WAYPOINT_KEEPALIVE") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.database.keepalive_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("WAYPOINT_BATCH_TRANSACTION") {
+            self.migrations.batch_transaction = v == "1" || v.eq_ignore_ascii_case("true");
+        }
         if let Ok(v) = std::env::var("WAYPOINT_ENVIRONMENT") {
             self.migrations.environment = Some(v);
         }
@@ -591,48 +707,26 @@ impl WaypointConfig {
     }
 
     fn apply_cli(&mut self, overrides: &CliOverrides) {
-        if let Some(ref v) = overrides.url {
-            self.database.url = Some(v.clone());
-        }
-        if let Some(ref v) = overrides.schema {
-            self.migrations.schema = v.clone();
-        }
-        if let Some(ref v) = overrides.table {
-            self.migrations.table = v.clone();
-        }
-        if let Some(ref v) = overrides.locations {
-            self.migrations.locations = v.clone();
-        }
-        if let Some(v) = overrides.out_of_order {
-            self.migrations.out_of_order = v;
-        }
-        if let Some(v) = overrides.validate_on_migrate {
-            self.migrations.validate_on_migrate = v;
-        }
-        if let Some(ref v) = overrides.baseline_version {
-            self.migrations.baseline_version = v.clone();
-        }
-        if let Some(v) = overrides.connect_retries {
-            self.database.connect_retries = v;
-        }
+        apply_option_some_clone!(overrides.url => self.database.url);
+        apply_option_clone!(overrides.schema => self.migrations.schema);
+        apply_option_clone!(overrides.table => self.migrations.table);
+        apply_option_clone!(overrides.locations => self.migrations.locations);
+        apply_option!(overrides.out_of_order => self.migrations.out_of_order);
+        apply_option!(overrides.validate_on_migrate => self.migrations.validate_on_migrate);
+        apply_option_clone!(overrides.baseline_version => self.migrations.baseline_version);
+        apply_option!(overrides.connect_retries => self.database.connect_retries);
         if let Some(ref v) = overrides.ssl_mode {
             // Ignore parse errors here — they'll be caught in validation
             if let Ok(mode) = v.parse() {
                 self.database.ssl_mode = mode;
             }
         }
-        if let Some(v) = overrides.connect_timeout {
-            self.database.connect_timeout_secs = v;
-        }
-        if let Some(v) = overrides.statement_timeout {
-            self.database.statement_timeout_secs = v;
-        }
-        if let Some(ref v) = overrides.environment {
-            self.migrations.environment = Some(v.clone());
-        }
-        if let Some(v) = overrides.dependency_ordering {
-            self.migrations.dependency_ordering = v;
-        }
+        apply_option!(overrides.connect_timeout => self.database.connect_timeout_secs);
+        apply_option!(overrides.statement_timeout => self.database.statement_timeout_secs);
+        apply_option_some_clone!(overrides.environment => self.migrations.environment);
+        apply_option!(overrides.dependency_ordering => self.migrations.dependency_ordering);
+        apply_option!(overrides.keepalive => self.database.keepalive_secs);
+        apply_option!(overrides.batch_transaction => self.migrations.batch_transaction);
     }
 
     /// Build a connection string from the config.
@@ -661,7 +755,9 @@ impl WaypointConfig {
         );
 
         if let Some(ref password) = self.database.password {
-            url.push_str(&format!(" password={}", password));
+            // Quote password to handle special characters (spaces, quotes, etc.)
+            let escaped = password.replace('\\', "\\\\").replace('\'', "\\'");
+            url.push_str(&format!(" password='{}'", escaped));
         }
 
         Ok(url)
@@ -781,7 +877,7 @@ mod tests {
         assert!(conn.contains("port=5433"));
         assert!(conn.contains("user=myuser"));
         assert!(conn.contains("dbname=mydb"));
-        assert!(conn.contains("password=secret"));
+        assert!(conn.contains("password='secret'"));
     }
 
     #[test]
@@ -808,6 +904,8 @@ mod tests {
             statement_timeout: None,
             environment: None,
             dependency_ordering: None,
+            keepalive: None,
+            batch_transaction: None,
         };
 
         config.apply_cli(&overrides);
@@ -924,5 +1022,22 @@ app_name = "myapp"
             normalize_location("filesystem:db/migrations"),
             PathBuf::from("db/migrations")
         );
+    }
+
+    #[test]
+    fn test_connection_string_password_special_chars() {
+        let config = WaypointConfig {
+            database: DatabaseConfig {
+                host: Some("localhost".to_string()),
+                port: Some(5432),
+                user: Some("admin".to_string()),
+                database: Some("mydb".to_string()),
+                password: Some("p@ss'w ord".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let conn = config.connection_string().unwrap();
+        assert!(conn.contains("password='p@ss\\'w ord'"));
     }
 }

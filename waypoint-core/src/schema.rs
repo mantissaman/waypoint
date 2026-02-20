@@ -2,6 +2,8 @@
 //!
 //! Used by diff, drift, and snapshot commands.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::Serialize;
 use tokio_postgres::Client;
 
@@ -164,7 +166,12 @@ pub enum SchemaDiff {
     /// A column was dropped from an existing table.
     ColumnDropped { table: String, column: String },
     /// A column definition was altered in an existing table.
-    ColumnAltered { table: String, column: String, from: ColumnDef, to: ColumnDef },
+    ColumnAltered {
+        table: String,
+        column: String,
+        from: ColumnDef,
+        to: ColumnDef,
+    },
     /// An index was added in the target schema.
     IndexAdded(IndexDef),
     /// An index was dropped from the target schema.
@@ -174,7 +181,11 @@ pub enum SchemaDiff {
     /// A view was dropped from the target schema.
     ViewDropped(String),
     /// A view definition was altered.
-    ViewAltered { name: String, from: String, to: String },
+    ViewAltered {
+        name: String,
+        from: String,
+        to: String,
+    },
     /// A sequence was added in the target schema.
     SequenceAdded(SequenceDef),
     /// A sequence was dropped from the target schema.
@@ -209,7 +220,11 @@ impl std::fmt::Display for SchemaDiff {
             SchemaDiff::TableAdded(t) => write!(f, "+ TABLE {}", t.name),
             SchemaDiff::TableDropped(n) => write!(f, "- TABLE {}", n),
             SchemaDiff::ColumnAdded { table, column } => {
-                write!(f, "+ COLUMN {}.{} ({})", table, column.name, column.data_type)
+                write!(
+                    f,
+                    "+ COLUMN {}.{} ({})",
+                    table, column.name, column.data_type
+                )
             }
             SchemaDiff::ColumnDropped { table, column } => {
                 write!(f, "- COLUMN {}.{}", table, column)
@@ -247,15 +262,18 @@ impl std::fmt::Display for SchemaDiff {
 
 /// Introspect the current state of a PostgreSQL schema.
 pub async fn introspect(client: &Client, schema: &str) -> Result<SchemaSnapshot> {
-    let tables = introspect_tables(client, schema).await?;
-    let views = introspect_views(client, schema).await?;
-    let indexes = introspect_indexes(client, schema).await?;
-    let sequences = introspect_sequences(client, schema).await?;
-    let functions = introspect_functions(client, schema).await?;
-    let enums = introspect_enums(client, schema).await?;
-    let constraints = introspect_constraints(client, schema).await?;
-    let triggers = introspect_triggers(client, schema).await?;
-    let extensions = introspect_extensions(client).await?;
+    let (tables, views, indexes, sequences, functions, enums, constraints, triggers, extensions) =
+        tokio::try_join!(
+            introspect_tables(client, schema),
+            introspect_views(client, schema),
+            introspect_indexes(client, schema),
+            introspect_sequences(client, schema),
+            introspect_functions(client, schema),
+            introspect_enums(client, schema),
+            introspect_constraints(client, schema),
+            introspect_triggers(client, schema),
+            introspect_extensions(client),
+        )?;
 
     Ok(SchemaSnapshot {
         tables,
@@ -273,41 +291,51 @@ pub async fn introspect(client: &Client, schema: &str) -> Result<SchemaSnapshot>
 async fn introspect_tables(client: &Client, schema: &str) -> Result<Vec<TableDef>> {
     let rows = client
         .query(
-            "SELECT table_name FROM information_schema.tables
-             WHERE table_schema = $1 AND table_type = 'BASE TABLE'
-             ORDER BY table_name",
+            "SELECT t.table_name, c.column_name, c.data_type, c.is_nullable, c.column_default, c.ordinal_position
+             FROM information_schema.tables t
+             LEFT JOIN information_schema.columns c
+               ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+             WHERE t.table_schema = $1 AND t.table_type = 'BASE TABLE'
+             ORDER BY t.table_name, c.ordinal_position",
             &[&schema],
         )
         .await?;
 
-    let mut tables = Vec::new();
+    let mut tables: Vec<TableDef> = Vec::new();
+    let mut current_table: Option<String> = None;
+    let mut columns: Vec<ColumnDef> = Vec::new();
+
     for row in &rows {
         let table_name: String = row.get(0);
+        let col_name: Option<String> = row.get(1);
 
-        let col_rows = client
-            .query(
-                "SELECT column_name, data_type, is_nullable, column_default, ordinal_position
-                 FROM information_schema.columns
-                 WHERE table_schema = $1 AND table_name = $2
-                 ORDER BY ordinal_position",
-                &[&schema, &table_name],
-            )
-            .await?;
+        if current_table.as_ref() != Some(&table_name) {
+            if let Some(prev_name) = current_table.take() {
+                tables.push(TableDef {
+                    schema: schema.to_string(),
+                    name: prev_name,
+                    columns: std::mem::take(&mut columns),
+                });
+            }
+            current_table = Some(table_name.clone());
+        }
 
-        let columns = col_rows
-            .iter()
-            .map(|r| ColumnDef {
-                name: r.get(0),
-                data_type: r.get(1),
-                is_nullable: r.get::<_, String>(2) == "YES",
-                default: r.get(3),
-                ordinal_position: r.get(4),
-            })
-            .collect();
+        if let Some(name) = col_name {
+            columns.push(ColumnDef {
+                name,
+                data_type: row.get(2),
+                is_nullable: row.get::<_, String>(3) == "YES",
+                default: row.get(4),
+                ordinal_position: row.get(5),
+            });
+        }
+    }
 
+    // Don't forget the last table
+    if let Some(name) = current_table {
         tables.push(TableDef {
             schema: schema.to_string(),
-            name: table_name,
+            name,
             columns,
         });
     }
@@ -526,23 +554,90 @@ async fn introspect_extensions(client: &Client) -> Result<Vec<String>> {
 pub fn diff(before: &SchemaSnapshot, after: &SchemaSnapshot) -> Vec<SchemaDiff> {
     let mut diffs = Vec::new();
 
-    // Tables
+    // Build lookup maps for O(1) access
+
+    // Tables - keyed by name, value is reference to TableDef
+    let before_tables: HashMap<&str, &TableDef> =
+        before.tables.iter().map(|t| (t.name.as_str(), t)).collect();
+    let after_tables: HashMap<&str, &TableDef> =
+        after.tables.iter().map(|t| (t.name.as_str(), t)).collect();
+
+    // Views - keyed by name, value is reference to ViewDef
+    let before_views: HashMap<&str, &ViewDef> =
+        before.views.iter().map(|v| (v.name.as_str(), v)).collect();
+    let after_views: HashMap<&str, &ViewDef> =
+        after.views.iter().map(|v| (v.name.as_str(), v)).collect();
+
+    // Indexes - existence check only, keyed by name
+    let before_indexes: HashSet<&str> = before.indexes.iter().map(|i| i.name.as_str()).collect();
+    let after_indexes: HashSet<&str> = after.indexes.iter().map(|i| i.name.as_str()).collect();
+
+    // Sequences - existence check only, keyed by name
+    let before_sequences: HashSet<&str> =
+        before.sequences.iter().map(|s| s.name.as_str()).collect();
+    let after_sequences: HashSet<&str> = after.sequences.iter().map(|s| s.name.as_str()).collect();
+
+    // Functions - keyed by name, value is reference to FunctionDef
+    let before_functions: HashMap<&str, &FunctionDef> = before
+        .functions
+        .iter()
+        .map(|f| (f.name.as_str(), f))
+        .collect();
+    let after_functions: HashMap<&str, &FunctionDef> = after
+        .functions
+        .iter()
+        .map(|f| (f.name.as_str(), f))
+        .collect();
+
+    // Enums - existence check only, keyed by name
+    let before_enums: HashSet<&str> = before.enums.iter().map(|e| e.name.as_str()).collect();
+    let after_enums: HashSet<&str> = after.enums.iter().map(|e| e.name.as_str()).collect();
+
+    // Constraints - compound key (table_name, name)
+    let before_constraints: HashSet<(&str, &str)> = before
+        .constraints
+        .iter()
+        .map(|c| (c.table_name.as_str(), c.name.as_str()))
+        .collect();
+    let after_constraints: HashSet<(&str, &str)> = after
+        .constraints
+        .iter()
+        .map(|c| (c.table_name.as_str(), c.name.as_str()))
+        .collect();
+
+    // Triggers - compound key (table_name, name)
+    let before_triggers: HashSet<(&str, &str)> = before
+        .triggers
+        .iter()
+        .map(|t| (t.table_name.as_str(), t.name.as_str()))
+        .collect();
+    let after_triggers: HashSet<(&str, &str)> = after
+        .triggers
+        .iter()
+        .map(|t| (t.table_name.as_str(), t.name.as_str()))
+        .collect();
+
+    // Extensions - existence check only
+    let before_extensions: HashSet<&str> = before.extensions.iter().map(|e| e.as_str()).collect();
+    let after_extensions: HashSet<&str> = after.extensions.iter().map(|e| e.as_str()).collect();
+
+    // Tables: check dropped/altered then added
     for bt in &before.tables {
-        if let Some(at) = after.tables.iter().find(|t| t.name == bt.name) {
+        if let Some(at) = after_tables.get(bt.name.as_str()) {
             diff_columns(&mut diffs, &bt.name, &bt.columns, &at.columns);
         } else {
             diffs.push(SchemaDiff::TableDropped(bt.name.clone()));
         }
     }
     for at in &after.tables {
-        if !before.tables.iter().any(|t| t.name == at.name) {
+        if !before_tables.contains_key(at.name.as_str()) {
             diffs.push(SchemaDiff::TableAdded(at.clone()));
         }
     }
 
-    // Views
+    // Views: check dropped/altered then added
     for bv in &before.views {
-        if let Some(av) = after.views.iter().find(|v| v.name == bv.name) {
+        if let Some(av) = after_views.get(bv.name.as_str()) {
             if bv.definition != av.definition {
                 diffs.push(SchemaDiff::ViewAltered {
                     name: bv.name.clone(),
@@ -555,38 +650,38 @@ pub fn diff(before: &SchemaSnapshot, after: &SchemaSnapshot) -> Vec<SchemaDiff> 
         }
     }
     for av in &after.views {
-        if !before.views.iter().any(|v| v.name == av.name) {
+        if !before_views.contains_key(av.name.as_str()) {
             diffs.push(SchemaDiff::ViewAdded(av.clone()));
         }
     }
 
-    // Indexes
+    // Indexes: check dropped then added
     for bi in &before.indexes {
-        if !after.indexes.iter().any(|i| i.name == bi.name) {
+        if !after_indexes.contains(bi.name.as_str()) {
             diffs.push(SchemaDiff::IndexDropped(bi.name.clone()));
         }
     }
     for ai in &after.indexes {
-        if !before.indexes.iter().any(|i| i.name == ai.name) {
+        if !before_indexes.contains(ai.name.as_str()) {
             diffs.push(SchemaDiff::IndexAdded(ai.clone()));
         }
     }
 
-    // Sequences
+    // Sequences: check dropped then added
     for bs in &before.sequences {
-        if !after.sequences.iter().any(|s| s.name == bs.name) {
+        if !after_sequences.contains(bs.name.as_str()) {
             diffs.push(SchemaDiff::SequenceDropped(bs.name.clone()));
         }
     }
     for a_s in &after.sequences {
-        if !before.sequences.iter().any(|s| s.name == a_s.name) {
+        if !before_sequences.contains(a_s.name.as_str()) {
             diffs.push(SchemaDiff::SequenceAdded(a_s.clone()));
         }
     }
 
-    // Functions
+    // Functions: check dropped/altered then added
     for bf in &before.functions {
-        if let Some(af) = after.functions.iter().find(|f| f.name == bf.name) {
+        if let Some(af) = after_functions.get(bf.name.as_str()) {
             if bf.definition != af.definition {
                 diffs.push(SchemaDiff::FunctionAltered {
                     name: bf.name.clone(),
@@ -597,27 +692,26 @@ pub fn diff(before: &SchemaSnapshot, after: &SchemaSnapshot) -> Vec<SchemaDiff> 
         }
     }
     for af in &after.functions {
-        if !before.functions.iter().any(|f| f.name == af.name) {
+        if !before_functions.contains_key(af.name.as_str()) {
             diffs.push(SchemaDiff::FunctionAdded(af.clone()));
         }
     }
 
-    // Enums
+    // Enums: check dropped then added
     for be in &before.enums {
-        if !after.enums.iter().any(|e| e.name == be.name) {
+        if !after_enums.contains(be.name.as_str()) {
             diffs.push(SchemaDiff::EnumDropped(be.name.clone()));
         }
     }
     for ae in &after.enums {
-        if !before.enums.iter().any(|e| e.name == ae.name) {
+        if !before_enums.contains(ae.name.as_str()) {
             diffs.push(SchemaDiff::EnumAdded(ae.clone()));
         }
     }
 
-    // Constraints
+    // Constraints: check dropped then added
     for bc in &before.constraints {
-        let key = (&bc.table_name, &bc.name);
-        if !after.constraints.iter().any(|ac| (&ac.table_name, &ac.name) == key) {
+        if !after_constraints.contains(&(bc.table_name.as_str(), bc.name.as_str())) {
             diffs.push(SchemaDiff::ConstraintDropped {
                 table: bc.table_name.clone(),
                 name: bc.name.clone(),
@@ -625,16 +719,14 @@ pub fn diff(before: &SchemaSnapshot, after: &SchemaSnapshot) -> Vec<SchemaDiff> 
         }
     }
     for ac in &after.constraints {
-        let key = (&ac.table_name, &ac.name);
-        if !before.constraints.iter().any(|bc| (&bc.table_name, &bc.name) == key) {
+        if !before_constraints.contains(&(ac.table_name.as_str(), ac.name.as_str())) {
             diffs.push(SchemaDiff::ConstraintAdded(ac.clone()));
         }
     }
 
-    // Triggers
+    // Triggers: check dropped then added
     for bt in &before.triggers {
-        let key = (&bt.table_name, &bt.name);
-        if !after.triggers.iter().any(|at| (&at.table_name, &at.name) == key) {
+        if !after_triggers.contains(&(bt.table_name.as_str(), bt.name.as_str())) {
             diffs.push(SchemaDiff::TriggerDropped {
                 table: bt.table_name.clone(),
                 name: bt.name.clone(),
@@ -642,20 +734,19 @@ pub fn diff(before: &SchemaSnapshot, after: &SchemaSnapshot) -> Vec<SchemaDiff> 
         }
     }
     for at in &after.triggers {
-        let key = (&at.table_name, &at.name);
-        if !before.triggers.iter().any(|bt| (&bt.table_name, &bt.name) == key) {
+        if !before_triggers.contains(&(at.table_name.as_str(), at.name.as_str())) {
             diffs.push(SchemaDiff::TriggerAdded(at.clone()));
         }
     }
 
-    // Extensions
+    // Extensions: check dropped then added
     for ext in &before.extensions {
-        if !after.extensions.contains(ext) {
+        if !after_extensions.contains(ext.as_str()) {
             diffs.push(SchemaDiff::ExtensionDropped(ext.clone()));
         }
     }
     for ext in &after.extensions {
-        if !before.extensions.contains(ext) {
+        if !before_extensions.contains(ext.as_str()) {
             diffs.push(SchemaDiff::ExtensionAdded(ext.clone()));
         }
     }
@@ -663,15 +754,25 @@ pub fn diff(before: &SchemaSnapshot, after: &SchemaSnapshot) -> Vec<SchemaDiff> 
     diffs
 }
 
-fn diff_columns(diffs: &mut Vec<SchemaDiff>, table: &str, before: &[ColumnDef], after: &[ColumnDef]) {
+fn diff_columns(
+    diffs: &mut Vec<SchemaDiff>,
+    table: &str,
+    before: &[ColumnDef],
+    after: &[ColumnDef],
+) {
+    let before_cols: HashMap<&str, &ColumnDef> =
+        before.iter().map(|c| (c.name.as_str(), c)).collect();
+    let after_cols: HashMap<&str, &ColumnDef> =
+        after.iter().map(|c| (c.name.as_str(), c)).collect();
+
     for bc in before {
-        if let Some(ac) = after.iter().find(|c| c.name == bc.name) {
-            if bc != ac {
+        if let Some(ac) = after_cols.get(bc.name.as_str()) {
+            if bc != *ac {
                 diffs.push(SchemaDiff::ColumnAltered {
                     table: table.to_string(),
                     column: bc.name.clone(),
                     from: bc.clone(),
-                    to: ac.clone(),
+                    to: (*ac).clone(),
                 });
             }
         } else {
@@ -682,7 +783,7 @@ fn diff_columns(diffs: &mut Vec<SchemaDiff>, table: &str, before: &[ColumnDef], 
         }
     }
     for ac in after {
-        if !before.iter().any(|bc| bc.name == ac.name) {
+        if !before_cols.contains_key(ac.name.as_str()) {
             diffs.push(SchemaDiff::ColumnAdded {
                 table: table.to_string(),
                 column: ac.clone(),
@@ -719,7 +820,10 @@ pub fn generate_ddl(diffs: &[SchemaDiff]) -> String {
                 ));
             }
             SchemaDiff::TableDropped(name) => {
-                statements.push(format!("DROP TABLE IF EXISTS {} CASCADE;", quote_ident(name)));
+                statements.push(format!(
+                    "DROP TABLE IF EXISTS {} CASCADE;",
+                    quote_ident(name)
+                ));
             }
             SchemaDiff::ColumnAdded { table, column } => {
                 let mut stmt = format!(
@@ -744,7 +848,9 @@ pub fn generate_ddl(diffs: &[SchemaDiff]) -> String {
                     quote_ident(column)
                 ));
             }
-            SchemaDiff::ColumnAltered { table, column, to, .. } => {
+            SchemaDiff::ColumnAltered {
+                table, column, to, ..
+            } => {
                 statements.push(format!(
                     "ALTER TABLE {} ALTER COLUMN {} TYPE {};",
                     quote_ident(table),
@@ -802,7 +908,10 @@ pub fn generate_ddl(diffs: &[SchemaDiff]) -> String {
                 ));
             }
             SchemaDiff::ViewDropped(name) => {
-                statements.push(format!("DROP VIEW IF EXISTS {} CASCADE;", quote_ident(name)));
+                statements.push(format!(
+                    "DROP VIEW IF EXISTS {} CASCADE;",
+                    quote_ident(name)
+                ));
             }
             SchemaDiff::ViewAltered { name, to, .. } => {
                 statements.push(format!(
@@ -821,11 +930,17 @@ pub fn generate_ddl(diffs: &[SchemaDiff]) -> String {
                 statements.push(format!("{};", func.definition.trim_end_matches(';')));
             }
             SchemaDiff::FunctionDropped(name) => {
-                statements.push(format!("DROP FUNCTION IF EXISTS {} CASCADE;", quote_ident(name)));
+                statements.push(format!(
+                    "DROP FUNCTION IF EXISTS {} CASCADE;",
+                    quote_ident(name)
+                ));
             }
             SchemaDiff::FunctionAltered { name } => {
                 // For altered functions we'd need the full definition; leave a comment
-                statements.push(format!("-- Function {} was altered; manual review needed", name));
+                statements.push(format!(
+                    "-- Function {} was altered; manual review needed",
+                    name
+                ));
             }
             SchemaDiff::EnumAdded(e) => {
                 let values: Vec<String> = e.values.iter().map(|v| format!("'{}'", v)).collect();
@@ -836,7 +951,10 @@ pub fn generate_ddl(diffs: &[SchemaDiff]) -> String {
                 ));
             }
             SchemaDiff::EnumDropped(name) => {
-                statements.push(format!("DROP TYPE IF EXISTS {} CASCADE;", quote_ident(name)));
+                statements.push(format!(
+                    "DROP TYPE IF EXISTS {} CASCADE;",
+                    quote_ident(name)
+                ));
             }
             SchemaDiff::ConstraintAdded(c) => {
                 statements.push(format!(
@@ -867,7 +985,10 @@ pub fn generate_ddl(diffs: &[SchemaDiff]) -> String {
                 ));
             }
             SchemaDiff::ExtensionAdded(name) => {
-                statements.push(format!("CREATE EXTENSION IF NOT EXISTS {};", quote_ident(name)));
+                statements.push(format!(
+                    "CREATE EXTENSION IF NOT EXISTS {};",
+                    quote_ident(name)
+                ));
             }
             SchemaDiff::ExtensionDropped(name) => {
                 statements.push(format!("DROP EXTENSION IF EXISTS {};", quote_ident(name)));
@@ -884,7 +1005,10 @@ pub fn to_ddl(snapshot: &SchemaSnapshot) -> String {
 
     // Extensions first
     for ext in &snapshot.extensions {
-        statements.push(format!("CREATE EXTENSION IF NOT EXISTS {};", quote_ident(ext)));
+        statements.push(format!(
+            "CREATE EXTENSION IF NOT EXISTS {};",
+            quote_ident(ext)
+        ));
     }
 
     // Enums before tables (types must exist for columns)

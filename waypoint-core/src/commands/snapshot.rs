@@ -135,11 +135,17 @@ pub async fn execute_restore(
     snapshot_id: &str,
 ) -> Result<RestoreReport> {
     let schema_name = &config.migrations.schema;
-    let sql_path = snapshot_config.directory.join(format!("{}.sql", snapshot_id));
+    let sql_path = snapshot_config
+        .directory
+        .join(format!("{}.sql", snapshot_id));
 
     if !sql_path.exists() {
         return Err(WaypointError::SnapshotError {
-            reason: format!("Snapshot '{}' not found at {}", snapshot_id, sql_path.display()),
+            reason: format!(
+                "Snapshot '{}' not found at {}",
+                snapshot_id,
+                sql_path.display()
+            ),
         });
     }
 
@@ -172,7 +178,11 @@ pub async fn execute_restore(
         match client.batch_execute(trimmed).await {
             Ok(()) => objects_restored += 1,
             Err(e) => {
-                log::warn!("Failed to restore statement, continuing; statement={}, error={}", &trimmed[..trimmed.len().min(80)], e);
+                log::warn!(
+                    "Failed to restore statement, continuing; statement={}, error={}",
+                    &trimmed[..trimmed.len().min(80)],
+                    e
+                );
             }
         }
     }
@@ -204,10 +214,7 @@ pub fn list_snapshots(snapshot_config: &SnapshotConfig) -> Result<Vec<SnapshotIn
             let created = meta
                 .modified()
                 .ok()
-                .and_then(|t| {
-                    t.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .ok()
-                })
+                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
                 .map(|d| {
                     chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
                         .unwrap_or_default()
@@ -232,14 +239,15 @@ pub fn list_snapshots(snapshot_config: &SnapshotConfig) -> Result<Vec<SnapshotIn
 fn prune_snapshots(dir: &PathBuf, max: usize) -> Result<()> {
     let mut sql_files: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "sql")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "sql"))
         .collect();
 
-    sql_files.sort_by_key(|e| e.file_name());
+    sql_files.sort_by_key(|e| {
+        e.metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
 
     while sql_files.len() > max {
         if let Some(oldest) = sql_files.first() {

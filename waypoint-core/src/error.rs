@@ -26,6 +26,10 @@ pub fn format_db_error(e: &tokio_postgres::Error) -> String {
         msg.push_str(&format!(": {}", s));
         source = s.source();
     }
+    // Append connection-loss context when the connection is closed
+    if e.is_closed() {
+        msg.push_str("\n  Note: The database connection was closed unexpectedly. This may indicate a network issue or server restart.");
+    }
     msg
 }
 
@@ -157,6 +161,34 @@ pub enum WaypointError {
     /// One or more pre-flight safety checks failed before migration could proceed.
     #[error("Pre-flight checks failed: {checks}")]
     PreflightFailed { checks: String },
+
+    /// A guard precondition or postcondition check failed.
+    #[error("Guard {kind} failed for {script}: {expression}")]
+    GuardFailed {
+        kind: String,
+        script: String,
+        expression: String,
+    },
+
+    /// A migration was blocked by a DANGER safety verdict.
+    #[error("Migration blocked for {script}: {reason}. Use --force to override.")]
+    MigrationBlocked { script: String, reason: String },
+
+    /// A schema advisor analysis encountered an error.
+    #[error("Advisor error: {0}")]
+    AdvisorError(String),
+
+    /// A migration simulation failed.
+    #[error("Simulation failed: {reason}")]
+    SimulationFailed { reason: String },
+
+    /// A migration contains statements that cannot run inside a transaction (e.g. CONCURRENTLY).
+    #[error("Migration {script} contains non-transactional statement: {statement}. Remove --transaction or rewrite the migration.")]
+    NonTransactionalStatement { script: String, statement: String },
+
+    /// The database connection was lost during an operation.
+    #[error("Connection lost during {operation}: {detail}")]
+    ConnectionLost { operation: String, detail: String },
 }
 
 /// Convenience type alias for `Result<T, WaypointError>`.

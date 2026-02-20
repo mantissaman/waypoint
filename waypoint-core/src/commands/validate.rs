@@ -105,7 +105,12 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Validat
 
     let valid = issues.is_empty();
 
-    log::info!("Validation completed; valid={}, issue_count={}, warning_count={}", valid, issues.len(), warnings.len());
+    log::info!(
+        "Validation completed; valid={}, issue_count={}, warning_count={}",
+        valid,
+        issues.len(),
+        warnings.len()
+    );
 
     if !valid {
         return Err(WaypointError::ValidationFailed(issues.join("\n")));

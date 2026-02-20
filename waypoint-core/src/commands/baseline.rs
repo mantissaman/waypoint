@@ -3,6 +3,7 @@
 use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;
+use crate::db;
 use crate::error::{Result, WaypointError};
 use crate::history;
 
@@ -12,6 +13,27 @@ use crate::history;
 /// 2. Create history table
 /// 3. Insert a single baseline row
 pub async fn execute(
+    client: &Client,
+    config: &WaypointConfig,
+    baseline_version: Option<&str>,
+    baseline_description: Option<&str>,
+) -> Result<()> {
+    let table = &config.migrations.table;
+
+    // Acquire advisory lock to prevent concurrent operations
+    db::acquire_advisory_lock(client, table).await?;
+
+    let result = execute_inner(client, config, baseline_version, baseline_description).await;
+
+    // Always release the lock
+    if let Err(e) = db::release_advisory_lock(client, table).await {
+        log::error!("Failed to release advisory lock: {}", e);
+    }
+
+    result
+}
+
+async fn execute_inner(
     client: &Client,
     config: &WaypointConfig,
     baseline_version: Option<&str>,
@@ -45,13 +67,17 @@ pub async fn execute(
         description,
         "BASELINE",
         "<< Waypoint Baseline >>",
-        None, // no checksum for baseline
+        None,
         installed_by,
-        0, // no execution time
+        0,
         true,
     )
     .await?;
 
-    log::info!("Successfully baselined schema; version={}, schema={}", version, schema);
+    log::info!(
+        "Successfully baselined schema; version={}, schema={}",
+        version,
+        schema
+    );
     Ok(())
 }

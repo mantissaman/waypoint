@@ -1,4 +1,5 @@
-//! Undo applied migrations by executing U{version}__*.sql files.
+//! Undo applied migrations by executing U{version}__*.sql files,
+//! or auto-generated reversal SQL stored in the history table.
 
 use std::collections::HashMap;
 
@@ -45,6 +46,95 @@ pub struct UndoDetail {
     pub script: String,
     /// Execution time of the undo operation in milliseconds.
     pub execution_time_ms: i32,
+    /// Whether the undo used auto-generated reversal SQL.
+    pub auto_reversal: bool,
+}
+
+/// Execute undo SQL within an atomic transaction (BEGIN/execute/history-insert/COMMIT).
+///
+/// On SQL execution failure, the transaction is rolled back and a best-effort
+/// failure record is inserted into the history table. Returns the execution
+/// time in milliseconds on success.
+#[allow(clippy::too_many_arguments)]
+async fn execute_undo_sql(
+    client: &Client,
+    schema: &str,
+    table: &str,
+    version: &str,
+    description: &str,
+    script: &str,
+    checksum: Option<i32>,
+    installed_by: &str,
+    sql: &str,
+) -> Result<i32> {
+    let start = std::time::Instant::now();
+    client.batch_execute("BEGIN").await?;
+
+    match client.batch_execute(sql).await {
+        Ok(()) => {
+            let exec_time = start.elapsed().as_millis() as i32;
+            match history::insert_applied_migration(
+                client,
+                schema,
+                table,
+                Some(version),
+                description,
+                "UNDO_SQL",
+                script,
+                checksum,
+                installed_by,
+                exec_time,
+                true,
+            )
+            .await
+            {
+                Ok(()) => {
+                    client.batch_execute("COMMIT").await?;
+                    Ok(exec_time)
+                }
+                Err(e) => {
+                    if let Err(rb) = client.batch_execute("ROLLBACK").await {
+                        log::error!("Failed to rollback undo transaction: {}", rb);
+                    }
+                    Err(e)
+                }
+            }
+        }
+        Err(e) => {
+            if let Err(rollback_err) = client.batch_execute("ROLLBACK").await {
+                log::error!("Failed to rollback undo transaction: {}", rollback_err);
+            }
+
+            // Record failure — best-effort outside the rolled-back transaction
+            if let Err(record_err) = history::insert_applied_migration(
+                client,
+                schema,
+                table,
+                Some(version),
+                description,
+                "UNDO_SQL",
+                script,
+                checksum,
+                installed_by,
+                0,
+                false,
+            )
+            .await
+            {
+                log::warn!(
+                    "Failed to record undo failure; script={}, error={}",
+                    script,
+                    record_err
+                );
+            }
+
+            let reason = crate::error::format_db_error(&e);
+            Err(WaypointError::UndoFailed {
+                script: script.to_string(),
+                reason,
+            })
+        }
+    }
 }
 
 /// Execute the undo command.
@@ -62,12 +152,16 @@ pub async fn execute(
 
     // Always release the advisory lock
     if let Err(e) = db::release_advisory_lock(client, table).await {
-        log::warn!("Failed to release advisory lock: {}", e);
+        log::error!("Failed to release advisory lock: {}", e);
     }
 
     match &result {
         Ok(report) => {
-            log::info!("Undo completed; migrations_undone={}, total_time_ms={}", report.migrations_undone, report.total_time_ms);
+            log::info!(
+                "Undo completed; migrations_undone={}, total_time_ms={}",
+                report.migrations_undone,
+                report.total_time_ms
+            );
         }
         Err(e) => {
             log::error!("Undo failed: {}", e);
@@ -139,82 +233,90 @@ async fn run_undo(
 
     // Execute undo for each version (newest first)
     for version in &versions_to_undo {
-        let undo_migration = undo_by_version.get(&version.raw).ok_or_else(|| {
-            WaypointError::UndoMissing {
+        // Try manual U file first, then fall back to auto-generated reversal
+        if let Some(undo_migration) = undo_by_version.get(&version.raw) {
+            // Manual undo file takes precedence
+            log::info!(
+                "Undoing migration (manual); migration={}, schema={}",
+                undo_migration.script,
+                schema
+            );
+
+            let placeholders = build_placeholders(
+                &config.placeholders,
+                schema,
+                &db_user,
+                &db_name,
+                &undo_migration.script,
+            );
+            let sql = replace_placeholders(&undo_migration.sql, &placeholders)?;
+
+            let exec_time = execute_undo_sql(
+                client,
+                schema,
+                table,
+                &version.raw,
+                &undo_migration.description,
+                &undo_migration.script,
+                Some(undo_migration.checksum),
+                installed_by,
+                &sql,
+            )
+            .await?;
+
+            report.migrations_undone += 1;
+            report.total_time_ms += exec_time;
+            report.details.push(UndoDetail {
                 version: version.raw.clone(),
-            }
-        })?;
+                description: undo_migration.description.clone(),
+                script: undo_migration.script.clone(),
+                execution_time_ms: exec_time,
+                auto_reversal: false,
+            });
+        } else if config.reversals.enabled {
+            // Fall back to auto-generated reversal SQL from history table
+            match crate::reversal::get_reversal(client, schema, table, &version.raw).await? {
+                Some(reversal_sql) => {
+                    let script = format!("auto-reversal:V{}", version.raw);
+                    log::info!(
+                        "Undoing migration (auto-reversal); version={}, schema={}",
+                        version.raw,
+                        schema
+                    );
 
-        log::info!("Undoing migration; migration={}, schema={}", undo_migration.script, schema);
+                    let exec_time = execute_undo_sql(
+                        client,
+                        schema,
+                        table,
+                        &version.raw,
+                        "Auto-generated reversal",
+                        &script,
+                        None,
+                        installed_by,
+                        &reversal_sql,
+                    )
+                    .await?;
 
-        // Build and apply placeholders
-        let placeholders = build_placeholders(
-            &config.placeholders,
-            schema,
-            &db_user,
-            &db_name,
-            &undo_migration.script,
-        );
-        let sql = replace_placeholders(&undo_migration.sql, &placeholders)?;
-
-        // Execute in transaction
-        match db::execute_in_transaction(client, &sql).await {
-            Ok(exec_time) => {
-                // Record UNDO_SQL success
-                history::insert_applied_migration(
-                    client,
-                    schema,
-                    table,
-                    Some(&version.raw),
-                    &undo_migration.description,
-                    "UNDO_SQL",
-                    &undo_migration.script,
-                    Some(undo_migration.checksum),
-                    installed_by,
-                    exec_time,
-                    true,
-                )
-                .await?;
-
-                report.migrations_undone += 1;
-                report.total_time_ms += exec_time;
-                report.details.push(UndoDetail {
-                    version: version.raw.clone(),
-                    description: undo_migration.description.clone(),
-                    script: undo_migration.script.clone(),
-                    execution_time_ms: exec_time,
-                });
-            }
-            Err(e) => {
-                // Record failure
-                if let Err(record_err) = history::insert_applied_migration(
-                    client,
-                    schema,
-                    table,
-                    Some(&version.raw),
-                    &undo_migration.description,
-                    "UNDO_SQL",
-                    &undo_migration.script,
-                    Some(undo_migration.checksum),
-                    installed_by,
-                    0,
-                    false,
-                )
-                .await
-                {
-                    log::warn!("Failed to record undo failure in history table; script={}, error={}", undo_migration.script, record_err);
+                    report.migrations_undone += 1;
+                    report.total_time_ms += exec_time;
+                    report.details.push(UndoDetail {
+                        version: version.raw.clone(),
+                        description: "Auto-generated reversal".to_string(),
+                        script,
+                        execution_time_ms: exec_time,
+                        auto_reversal: true,
+                    });
                 }
-
-                let reason = match &e {
-                    WaypointError::DatabaseError(db_err) => crate::error::format_db_error(db_err),
-                    other => other.to_string(),
-                };
-                log::error!("Undo failed; script={}, reason={}", undo_migration.script, reason);
-                return Err(WaypointError::UndoFailed {
-                    script: undo_migration.script.clone(),
-                    reason,
-                });
+                None => {
+                    return Err(WaypointError::UndoMissing {
+                        version: version.raw.clone(),
+                    });
+                }
             }
+        } else {
+            return Err(WaypointError::UndoMissing {
+                version: version.raw.clone(),
+            });
         }
     }
 

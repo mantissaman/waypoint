@@ -220,12 +220,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = execute(
-            &[dir.path().to_path_buf()],
-            Some("2"),
-            Some("2"),
-        )
-        .unwrap();
+        let report = execute(&[dir.path().to_path_buf()], Some("2"), Some("2")).unwrap();
         assert_eq!(report.versions.len(), 1);
         assert_eq!(report.versions[0].version.as_deref(), Some("2"));
     }

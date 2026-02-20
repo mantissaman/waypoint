@@ -29,6 +29,8 @@ pub struct AppliedMigration {
     pub execution_time: i32,
     /// Whether the migration completed successfully.
     pub success: bool,
+    /// Auto-generated reverse SQL, if available.
+    pub reversal_sql: Option<String>,
 }
 
 /// Create the schema history table if it does not exist.
@@ -48,7 +50,8 @@ CREATE TABLE IF NOT EXISTS {fq} (
     installed_by   VARCHAR(100) NOT NULL,
     installed_on   TIMESTAMPTZ NOT NULL DEFAULT now(),
     execution_time INTEGER NOT NULL,
-    success        BOOLEAN NOT NULL
+    success        BOOLEAN NOT NULL,
+    reversal_sql   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS {idx_name} ON {fq} (success);
@@ -60,6 +63,25 @@ CREATE INDEX IF NOT EXISTS {ver_idx_name} ON {fq} (version);
     );
 
     client.batch_execute(&sql).await?;
+
+    // Auto-upgrade: add reversal_sql column if table already existed without it
+    upgrade_history_table(client, schema, table).await?;
+
+    Ok(())
+}
+
+/// Auto-upgrade the history table to add new columns if they don't exist.
+async fn upgrade_history_table(client: &Client, schema: &str, table: &str) -> Result<()> {
+    let fq = format!("{}.{}", quote_ident(schema), quote_ident(table));
+    // Add reversal_sql column if it doesn't exist
+    let sql = format!(
+        "ALTER TABLE {fq} ADD COLUMN IF NOT EXISTS reversal_sql TEXT",
+        fq = fq,
+    );
+    // Ignore errors (e.g., if the column already exists on older PG without IF NOT EXISTS)
+    if let Err(e) = client.batch_execute(&sql).await {
+        log::debug!("History table upgrade (reversal_sql): {}", e);
+    }
     Ok(())
 }
 
@@ -97,7 +119,7 @@ pub async fn get_applied_migrations(
 ) -> Result<Vec<AppliedMigration>> {
     let sql = format!(
         "SELECT installed_rank, version, description, type, script, checksum, \
-         installed_by, installed_on, execution_time, success \
+         installed_by, installed_on, execution_time, success, reversal_sql \
          FROM {}.{} ORDER BY installed_rank",
         quote_ident(schema),
         quote_ident(table)
@@ -118,6 +140,7 @@ pub async fn get_applied_migrations(
             installed_on: row.get(7),
             execution_time: row.get(8),
             success: row.get(9),
+            reversal_sql: row.get(10),
         });
     }
 
@@ -223,7 +246,9 @@ pub async fn update_repeatable_checksum(
 /// For each version, tracks whether the latest successful action was a forward
 /// migration (`"SQL"` / `"BASELINE"`) or an undo (`"UNDO_SQL"`).
 /// Returns the set of version strings that are currently applied.
-pub fn effective_applied_versions(applied: &[AppliedMigration]) -> std::collections::HashSet<String> {
+pub fn effective_applied_versions(
+    applied: &[AppliedMigration],
+) -> std::collections::HashSet<String> {
     let mut effective = std::collections::HashSet::new();
     for am in applied {
         if !am.success {

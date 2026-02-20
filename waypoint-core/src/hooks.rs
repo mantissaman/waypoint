@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use tokio_postgres::Client;
 
-use crate::config::{HooksConfig, WaypointConfig};
+use crate::config::HooksConfig;
 use crate::db;
 use crate::error::{Result, WaypointError};
 use crate::placeholder::replace_placeholders;
@@ -181,7 +181,6 @@ pub fn load_config_hooks(config: &HooksConfig) -> Result<Vec<ResolvedHook>> {
 /// Returns total execution time in milliseconds.
 pub async fn run_hooks(
     client: &Client,
-    _config: &WaypointConfig,
     hooks: &[ResolvedHook],
     phase: &HookType,
     placeholders: &HashMap<String, String>,

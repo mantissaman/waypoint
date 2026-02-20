@@ -241,11 +241,20 @@ pub fn scan_migrations(locations: &[std::path::PathBuf]) -> Result<Vec<ResolvedM
             }
 
             // Skip files that don't start with V, U, or R
-            if !filename.starts_with('V') && !filename.starts_with('U') && !filename.starts_with('R') {
+            if !filename.starts_with('V')
+                && !filename.starts_with('U')
+                && !filename.starts_with('R')
+            {
                 continue;
             }
 
-            let (kind, description) = parse_migration_filename(&filename)?;
+            let (kind, description) = match parse_migration_filename(&filename) {
+                Ok(result) => result,
+                Err(e) => {
+                    log::warn!("Skipping malformed migration file '{}': {}", filename, e);
+                    continue;
+                }
+            };
             let sql = std::fs::read_to_string(&path)?;
             let checksum = calculate_checksum(&sql);
             let directives = directive::parse_directives(&sql);
@@ -285,6 +294,21 @@ pub fn scan_migrations(locations: &[std::path::PathBuf]) -> Result<Vec<ResolvedM
             _ => Ordering::Equal,
         }
     });
+
+    // Detect duplicate versions
+    let mut seen_versions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in &migrations {
+        if let Some(v) = m.version() {
+            let prefix = if m.is_versioned() { "V" } else { "U" };
+            let key = format!("{}{}", prefix, v.raw);
+            if !seen_versions.insert(key) {
+                return Err(WaypointError::ValidationFailed(format!(
+                    "Duplicate migration version '{}' found in file '{}'. Each version must be unique.",
+                    v.raw, m.script
+                )));
+            }
+        }
+    }
 
     Ok(migrations)
 }
@@ -378,6 +402,13 @@ mod tests {
             _ => panic!("Expected Undo"),
         }
         assert_eq!(desc, "Add column");
+    }
+
+    #[test]
+    fn test_malformed_filename_is_skipped() {
+        // This tests the parse function itself
+        assert!(parse_migration_filename("random.sql").is_err());
+        assert!(parse_migration_filename("V1_missing_separator.sql").is_err());
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;
+use crate::db;
 use crate::db::quote_ident;
 use crate::error::{Result, WaypointError};
 
@@ -19,11 +20,30 @@ pub async fn execute(
         return Err(WaypointError::CleanDisabled);
     }
 
+    let table = &config.migrations.table;
+
+    // Acquire advisory lock to prevent concurrent operations
+    db::acquire_advisory_lock(client, table).await?;
+
+    let result = execute_inner(client, config).await;
+
+    // Always release the lock
+    if let Err(e) = db::release_advisory_lock(client, table).await {
+        log::error!("Failed to release advisory lock: {}", e);
+    }
+
+    result
+}
+
+async fn execute_inner(client: &Client, config: &WaypointConfig) -> Result<Vec<String>> {
     let schema = &config.migrations.schema;
     let schema_q = quote_ident(schema);
     let mut dropped = Vec::new();
 
-    log::warn!("Starting clean — this will DROP all objects in the schema; schema={}", schema);
+    log::warn!(
+        "Starting clean — this will DROP all objects in the schema; schema={}",
+        schema
+    );
 
     // Drop materialized views
     let rows = client
@@ -143,7 +163,11 @@ pub async fn execute(
         dropped.push(format!("Type: {}.{}", schema, name));
     }
 
-    log::warn!("Clean completed; schema={}, objects_dropped={}", schema, dropped.len());
+    log::warn!(
+        "Clean completed; schema={}, objects_dropped={}",
+        schema,
+        dropped.len()
+    );
 
     Ok(dropped)
 }

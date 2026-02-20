@@ -3,6 +3,7 @@
 //! based on error type, and multi-database dispatch.
 
 mod output;
+#[cfg(feature = "self-update")]
 mod self_update;
 
 use std::process;
@@ -14,6 +15,31 @@ use waypoint_core::config::{normalize_location, CliOverrides, WaypointConfig};
 use waypoint_core::error::WaypointError;
 use waypoint_core::migration::MigrationVersion;
 use waypoint_core::{UndoTarget, Waypoint};
+
+/// Print a report as JSON (when `--json` is active) or via a terminal formatter.
+/// The 4-argument form accepts a `quiet` flag; when quiet and not JSON, output is suppressed.
+macro_rules! print_report {
+    ($report:expr, $json:expr, $printer:path) => {
+        if $json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&$report).expect("JSON serialization failed")
+            );
+        } else {
+            $printer(&$report);
+        }
+    };
+    ($report:expr, $json:expr, $quiet:expr, $printer:path) => {
+        if $json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&$report).expect("JSON serialization failed")
+            );
+        } else if !$quiet {
+            $printer(&$report);
+        }
+    };
+}
 
 /// Top-level CLI definition with global flags and subcommand dispatch.
 #[derive(Parser)]
@@ -114,6 +140,22 @@ struct Cli {
     /// Stop on first failure (multi-db mode)
     #[arg(long, global = true)]
     fail_fast: bool,
+
+    /// Override DANGER safety blocks
+    #[arg(long, global = true)]
+    force: bool,
+
+    /// Run simulation before migrate
+    #[arg(long, global = true)]
+    simulate: bool,
+
+    /// Wrap all pending migrations in a single transaction (all-or-nothing)
+    #[arg(long, global = true)]
+    transaction: bool,
+
+    /// TCP keepalive interval in seconds (0 to disable)
+    #[arg(long, value_name = "SECS", global = true)]
+    keepalive: Option<u32>,
 
     #[command(subcommand)]
     command: Commands,
@@ -229,7 +271,25 @@ enum Commands {
         git_hook: bool,
     },
 
+    /// Analyze migration safety (lock levels, impact estimation)
+    Safety {
+        /// Analyze a specific migration file
+        #[arg(value_name = "FILE")]
+        file: Option<String>,
+    },
+
+    /// Suggest schema improvements
+    Advise {
+        /// Write fix SQL to a migration file
+        #[arg(long, value_name = "PATH")]
+        fix_file: Option<String>,
+    },
+
+    /// Dry-run migrations in a temporary schema
+    Simulate,
+
     /// Update waypoint to the latest version
+    #[cfg(feature = "self-update")]
     SelfUpdate {
         /// Check for updates without installing
         #[arg(long)]
@@ -268,12 +328,25 @@ async fn main() {
 fn exit_code(error: &WaypointError) -> i32 {
     match error {
         WaypointError::ConfigError(_) => 2,
+        WaypointError::PlaceholderNotFound { .. } => 2,
+        WaypointError::DatabaseNotFound { .. } => 2,
         WaypointError::ValidationFailed(_) => 3,
+        WaypointError::ChecksumMismatch { .. } => 3,
+        WaypointError::BaselineExists => 3,
+        WaypointError::OutOfOrder { .. } => 3,
+        WaypointError::DependencyCycle { .. } => 3,
+        WaypointError::MissingDependency { .. } => 3,
+        WaypointError::InvalidDirective { .. } => 3,
+        WaypointError::MultiDbDependencyCycle { .. } => 3,
         WaypointError::DatabaseError(_) => 4,
+        WaypointError::ConnectionLost { .. } => 4,
         WaypointError::MigrationFailed { .. } => 5,
+        WaypointError::MigrationParseError(_) => 5,
         WaypointError::HookFailed { .. } => 5,
         WaypointError::UndoFailed { .. } => 5,
         WaypointError::UndoMissing { .. } => 5,
+        WaypointError::NonTransactionalStatement { .. } => 5,
+        WaypointError::MultiDbError { .. } => 5,
         WaypointError::LockError(_) => 6,
         WaypointError::CleanDisabled => 7,
         WaypointError::UpdateError(_) => 8,
@@ -281,7 +354,14 @@ fn exit_code(error: &WaypointError) -> i32 {
         WaypointError::DriftDetected { .. } => 10,
         WaypointError::ConflictsDetected { .. } => 11,
         WaypointError::PreflightFailed { .. } => 12,
-        _ => 1,
+        WaypointError::GuardFailed { .. } => 13,
+        WaypointError::MigrationBlocked { .. } => 14,
+        WaypointError::SimulationFailed { .. } => 15,
+        WaypointError::DiffFailed { .. } => 1,
+        WaypointError::SnapshotError { .. } => 1,
+        WaypointError::GitError(_) => 1,
+        WaypointError::AdvisorError(_) => 1,
+        WaypointError::IoError(_) => 1,
     }
 }
 
@@ -289,9 +369,13 @@ fn exit_code(error: &WaypointError) -> i32 {
 async fn run(cli: Cli) -> Result<(), WaypointError> {
     let json_output = cli.json;
     let dry_run = cli.dry_run;
+    let quiet = cli.quiet;
     let skip_preflight = cli.skip_preflight;
+    let force = cli.force;
+    let simulate_flag = cli.simulate;
 
     // Handle self-update before config/DB setup (no database needed)
+    #[cfg(feature = "self-update")]
     if let Commands::SelfUpdate { check } = &cli.command {
         return self_update::self_update(*check, json_output);
     }
@@ -336,6 +420,8 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
         } else {
             None
         },
+        keepalive: cli.keepalive,
+        batch_transaction: if cli.transaction { Some(true) } else { None },
     };
 
     // Load config
@@ -354,11 +440,7 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
             disabled.extend(disable.iter().cloned());
             let report =
                 waypoint_core::commands::lint::execute(&config.migrations.locations, &disabled)?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            } else {
-                output::print_lint_report(&report);
-            }
+            print_report!(report, json_output, output::print_lint_report);
             if *strict && report.error_count > 0 {
                 return Err(WaypointError::LintFailed {
                     error_count: report.error_count,
@@ -374,10 +456,12 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
                 to.as_deref(),
             )?;
             if json_output {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).expect("JSON serialization failed")
+                );
             } else {
-                let fmt =
-                    waypoint_core::commands::changelog::ChangelogFormat::parse(format);
+                let fmt = waypoint_core::commands::changelog::ChangelogFormat::parse(format);
                 match fmt {
                     waypoint_core::commands::changelog::ChangelogFormat::Markdown => {
                         print!(
@@ -386,7 +470,11 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
                         );
                     }
                     waypoint_core::commands::changelog::ChangelogFormat::Json => {
-                        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report)
+                                .expect("JSON serialization failed")
+                        );
                     }
                     waypoint_core::commands::changelog::ChangelogFormat::PlainText => {
                         print!(
@@ -404,7 +492,10 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
                 base,
             )?;
             if json_output {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).expect("JSON serialization failed")
+                );
             } else if *git_hook {
                 if report.has_conflicts {
                     eprintln!(
@@ -434,11 +525,8 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
     // === Multi-database mode ===
     if let Some(ref databases) = config.multi_database {
         let order = waypoint_core::MultiWaypoint::execution_order(databases)?;
-        let clients = waypoint_core::MultiWaypoint::connect(
-            databases,
-            cli.database.as_deref(),
-        )
-        .await?;
+        let clients =
+            waypoint_core::MultiWaypoint::connect(databases, cli.database.as_deref()).await?;
 
         match &cli.command {
             Commands::Migrate { target } => {
@@ -450,11 +538,7 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
                     cli.fail_fast,
                 )
                 .await?;
-                if json_output {
-                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
-                } else {
-                    output::print_multi_result(&result);
-                }
+                print_report!(result, json_output, output::print_multi_result);
                 if !result.all_succeeded {
                     return Err(WaypointError::MultiDbError {
                         name: "multi".to_string(),
@@ -463,17 +547,9 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
                 }
             }
             Commands::Info => {
-                let all_info = waypoint_core::MultiWaypoint::info(
-                    databases,
-                    &clients,
-                    &order,
-                )
-                .await?;
-                if json_output {
-                    println!("{}", serde_json::to_string_pretty(&all_info).unwrap());
-                } else {
-                    output::print_multi_info(&all_info);
-                }
+                let all_info =
+                    waypoint_core::MultiWaypoint::info(databases, &clients, &order).await?;
+                print_report!(all_info, json_output, output::print_multi_info);
             }
             _ => {
                 // For other commands, run on filtered single DB
@@ -481,8 +557,16 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
                     if let Some(db) = databases.iter().find(|d| &d.name == db_name) {
                         let single_config = db.to_waypoint_config();
                         let wp = Waypoint::new(single_config).await?;
-                        return run_single_db_command(&cli.command, &wp, json_output, dry_run)
-                            .await;
+                        return run_single_db_command(
+                            &cli.command,
+                            &wp,
+                            json_output,
+                            dry_run,
+                            force,
+                            simulate_flag,
+                            quiet,
+                        )
+                        .await;
                     }
                 }
                 return Err(WaypointError::ConfigError(
@@ -501,19 +585,46 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
         if let Commands::Migrate { .. } = &cli.command {
             let wp = Waypoint::new(config).await?;
             let report = waypoint_core::commands::explain::execute(wp.client(), &wp.config).await?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            } else {
-                output::print_explain_report(&report);
-            }
+            print_report!(report, json_output, output::print_explain_report);
             return Ok(());
         }
     }
 
-    // Create waypoint instance
-    let wp = Waypoint::new(config).await?;
+    // Create waypoint instance and run with transient error retry
+    let max_retries = config.database.connect_retries.min(3);
+    let mut retries_left = max_retries;
 
-    run_single_db_command(&cli.command, &wp, json_output, dry_run).await
+    loop {
+        let wp = Waypoint::new(config.clone()).await?;
+        match run_single_db_command(
+            &cli.command,
+            &wp,
+            json_output,
+            dry_run,
+            force,
+            simulate_flag,
+            quiet,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) if waypoint_core::db::is_transient_error(&e) && retries_left > 0 => {
+                retries_left -= 1;
+                let attempt = max_retries - retries_left;
+                eprintln!(
+                    "{}",
+                    format!(
+                        "Connection lost, reconnecting ({}/{})...",
+                        attempt, max_retries
+                    )
+                    .yellow()
+                );
+                let backoff = std::time::Duration::from_secs(std::cmp::min(1u64 << attempt, 10));
+                tokio::time::sleep(backoff).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Execute a subcommand against a single database instance.
@@ -522,55 +633,64 @@ async fn run_single_db_command(
     wp: &Waypoint,
     json_output: bool,
     _dry_run: bool,
+    force: bool,
+    simulate_before: bool,
+    quiet: bool,
 ) -> Result<(), WaypointError> {
     match command {
         Commands::Migrate { target, .. } => {
-            let report = wp.migrate(target.as_deref()).await?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            } else {
-                output::print_migrate_summary(&report);
+            // Optional: simulate before migrate
+            if simulate_before || wp.config.simulation.simulate_before_migrate {
+                let sim_report = wp.simulate().await?;
+                if !sim_report.passed {
+                    print_report!(sim_report, json_output, output::print_simulation_report);
+                    return Err(WaypointError::SimulationFailed {
+                        reason: sim_report
+                            .errors
+                            .iter()
+                            .map(|e| format!("{}: {}", e.script, e.error))
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    });
+                }
+                if !json_output && !quiet {
+                    output::print_simulation_report(&sim_report);
+                }
             }
+
+            let report = waypoint_core::commands::migrate::execute_with_options(
+                wp.client(),
+                &wp.config,
+                target.as_deref(),
+                force,
+            )
+            .await?;
+            print_report!(report, json_output, quiet, output::print_migrate_summary);
         }
         Commands::Info => {
             let infos = wp.info().await?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&infos).unwrap());
-            } else {
-                output::print_info_table(&infos);
-            }
+            print_report!(infos, json_output, quiet, output::print_info_table);
         }
         Commands::Validate => {
             let report = wp.validate().await?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            } else {
-                output::print_validate_result(&report);
-            }
+            print_report!(report, json_output, quiet, output::print_validate_result);
         }
         Commands::Repair => {
             let report = wp.repair().await?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            } else {
-                output::print_repair_result(&report);
-            }
+            print_report!(report, json_output, quiet, output::print_repair_result);
         }
         Commands::Baseline {
             baseline_version,
             baseline_description,
         } => {
-            wp.baseline(
-                baseline_version.as_deref(),
-                baseline_description.as_deref(),
-            )
-            .await?;
+            wp.baseline(baseline_version.as_deref(), baseline_description.as_deref())
+                .await?;
             if json_output {
                 println!(
                     "{}",
                     serde_json::json!({"success": true, "message": "Successfully baselined schema."})
                 );
-            } else {
+            } else if !quiet {
                 println!("{}", "Successfully baselined schema.".green().bold());
             }
         }
@@ -583,19 +703,11 @@ async fn run_single_db_command(
                 UndoTarget::Last
             };
             let report = wp.undo(undo_target).await?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            } else {
-                output::print_undo_summary(&report);
-            }
+            print_report!(report, json_output, output::print_undo_summary);
         }
         Commands::Clean { allow_clean } => {
             let dropped = wp.clean(*allow_clean).await?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&dropped).unwrap());
-            } else {
-                output::print_clean_result(&dropped);
-            }
+            print_report!(dropped, json_output, output::print_clean_result);
         }
         Commands::Diff {
             target_url,
@@ -611,11 +723,7 @@ async fn run_single_db_command(
                 }
             };
             let report = wp.diff(target).await?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            } else {
-                output::print_diff_report(&report);
-            }
+            print_report!(report, json_output, output::print_diff_report);
             if report.has_changes {
                 let output_path = if *auto_version {
                     // Determine next version from existing migrations
@@ -634,23 +742,14 @@ async fn run_single_db_command(
                     output_file.clone()
                 };
                 if let Some(path) = output_path {
-                    std::fs::write(&path, &report.generated_sql).map_err(|e| {
-                        WaypointError::IoError(e)
-                    })?;
-                    println!(
-                        "{}",
-                        format!("Generated SQL written to {}", path).green()
-                    );
+                    std::fs::write(&path, &report.generated_sql).map_err(WaypointError::IoError)?;
+                    println!("{}", format!("Generated SQL written to {}", path).green());
                 }
             }
         }
         Commands::Drift => {
             let report = wp.drift().await?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            } else {
-                output::print_drift_report(&report);
-            }
+            print_report!(report, json_output, output::print_drift_report);
             if report.has_drift {
                 return Err(WaypointError::DriftDetected {
                     count: report.drifts.len(),
@@ -665,46 +764,72 @@ async fn run_single_db_command(
         }
         Commands::Snapshot => {
             let report = wp.snapshot(&wp.config.snapshots).await?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            } else {
-                output::print_snapshot_report(&report);
-            }
+            print_report!(report, json_output, output::print_snapshot_report);
         }
-        Commands::Restore { snapshot_id } => {
-            match snapshot_id {
-                Some(id) => {
-                    let report = wp.restore(&wp.config.snapshots, id).await?;
-                    if json_output {
-                        println!("{}", serde_json::to_string_pretty(&report).unwrap());
-                    } else {
-                        output::print_restore_report(&report);
-                    }
-                }
-                None => {
-                    let snapshots =
-                        waypoint_core::commands::snapshot::list_snapshots(&wp.config.snapshots)?;
-                    if json_output {
-                        println!("{}", serde_json::to_string_pretty(&snapshots).unwrap());
-                    } else {
-                        output::print_snapshot_list(&snapshots);
-                    }
-                }
+        Commands::Restore { snapshot_id } => match snapshot_id {
+            Some(id) => {
+                let report = wp.restore(&wp.config.snapshots, id).await?;
+                print_report!(report, json_output, output::print_restore_report);
             }
-        }
+            None => {
+                let snapshots =
+                    waypoint_core::commands::snapshot::list_snapshots(&wp.config.snapshots)?;
+                print_report!(snapshots, json_output, output::print_snapshot_list);
+            }
+        },
         Commands::Preflight => {
             let report = wp.preflight().await?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            print_report!(report, json_output, output::print_preflight_report);
+        }
+        Commands::Safety { file } => {
+            if let Some(path) = file {
+                let report =
+                    waypoint_core::commands::safety::execute_file(wp.client(), &wp.config, path)
+                        .await?;
+                print_report!(report, json_output, output::print_safety_report);
             } else {
-                output::print_preflight_report(&report);
+                let report = wp.safety().await?;
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).expect("JSON serialization failed")
+                    );
+                } else {
+                    for r in &report.reports {
+                        output::print_safety_report(r);
+                    }
+                    output::print_safety_overall(report.overall_verdict);
+                }
+            }
+        }
+        Commands::Advise { fix_file } => {
+            let report = wp.advise().await?;
+            print_report!(report, json_output, output::print_advisor_report);
+            if let Some(path) = fix_file {
+                waypoint_core::commands::advisor::write_fix_file(&report, path)?;
+                println!("{}", format!("Fix SQL written to {}", path).green());
+            }
+        }
+        Commands::Simulate => {
+            let report = wp.simulate().await?;
+            print_report!(report, json_output, output::print_simulation_report);
+            if !report.passed {
+                return Err(WaypointError::SimulationFailed {
+                    reason: report
+                        .errors
+                        .iter()
+                        .map(|e| format!("{}: {}", e.script, e.error))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                });
             }
         }
         // No-DB commands handled earlier
-        Commands::Lint { .. }
-        | Commands::Changelog { .. }
-        | Commands::CheckConflicts { .. }
-        | Commands::SelfUpdate { .. } => {
+        Commands::Lint { .. } | Commands::Changelog { .. } | Commands::CheckConflicts { .. } => {
+            unreachable!("handled before DB setup")
+        }
+        #[cfg(feature = "self-update")]
+        Commands::SelfUpdate { .. } => {
             unreachable!("handled before DB setup")
         }
     }
@@ -755,9 +880,23 @@ fn print_error(error: &WaypointError) {
             eprintln!(
                 "{}",
                 format!(
-                    "Hint: Create a U{version}__<description>.sql file in your migrations directory."
+                    "Hint: Create a U{version}__<description>.sql file, or enable [reversals] for auto-generated undo."
                 )
                 .dimmed()
+            );
+        }
+        WaypointError::MigrationBlocked { .. } => {
+            eprintln!(
+                "{}",
+                "Hint: Use --force to override DANGER blocks, or add '-- waypoint:safety-override' to the migration."
+                    .dimmed()
+            );
+        }
+        WaypointError::GuardFailed { .. } => {
+            eprintln!(
+                "{}",
+                "Hint: Check guard conditions in your migration directives (-- waypoint:require / -- waypoint:ensure)."
+                    .dimmed()
             );
         }
         WaypointError::DriftDetected { .. } => {
@@ -774,6 +913,135 @@ fn print_error(error: &WaypointError) {
                     .dimmed()
             );
         }
-        _ => {}
+        WaypointError::NonTransactionalStatement { .. } => {
+            eprintln!(
+                "{}",
+                "Hint: Remove --transaction to apply migrations individually, or rewrite the migration to avoid CONCURRENTLY/VACUUM/etc."
+                    .dimmed()
+            );
+        }
+        WaypointError::ConnectionLost { .. } => {
+            eprintln!(
+                "{}",
+                "Hint: Run 'waypoint info' to check the current migration state.".dimmed()
+            );
+        }
+        WaypointError::PlaceholderNotFound { key, .. } => {
+            eprintln!(
+                "{}",
+                format!("Hint: Define placeholder '{}' in [placeholders] section of waypoint.toml or as an environment variable.", key).dimmed()
+            );
+        }
+        WaypointError::MigrationFailed { script, .. } => {
+            eprintln!(
+                "{}",
+                format!(
+                    "Hint: Fix the SQL error in '{}', then run 'waypoint repair' if needed.",
+                    script
+                )
+                .dimmed()
+            );
+        }
+        WaypointError::HookFailed { script, .. } => {
+            eprintln!(
+                "{}",
+                format!("Hint: Check the hook file '{}' for SQL errors.", script).dimmed()
+            );
+        }
+        WaypointError::UndoFailed { script, .. } => {
+            eprintln!(
+                "{}",
+                format!("Hint: Fix the SQL error in undo script '{}'.", script).dimmed()
+            );
+        }
+        WaypointError::ValidationFailed(_) => {
+            eprintln!(
+                "{}",
+                "Hint: Run 'waypoint validate' for details, then 'waypoint repair' to fix."
+                    .dimmed()
+            );
+        }
+        WaypointError::DependencyCycle { .. } => {
+            eprintln!(
+                "{}",
+                "Hint: Check '-- waypoint:depends' directives for circular references.".dimmed()
+            );
+        }
+        WaypointError::MissingDependency { .. } => {
+            eprintln!(
+                "{}",
+                "Hint: Ensure the referenced migration version exists in your migration locations."
+                    .dimmed()
+            );
+        }
+        WaypointError::InvalidDirective { .. } => {
+            eprintln!(
+                "{}",
+                "Hint: Check the '-- waypoint:' directive syntax in the migration file header."
+                    .dimmed()
+            );
+        }
+        WaypointError::PreflightFailed { .. } => {
+            eprintln!(
+                "{}",
+                "Hint: Use --skip-preflight to bypass, or resolve the database health issues."
+                    .dimmed()
+            );
+        }
+        WaypointError::ConflictsDetected { .. } => {
+            eprintln!(
+                "{}",
+                "Hint: Resolve migration version conflicts between branches before merging."
+                    .dimmed()
+            );
+        }
+        WaypointError::LockError(_) => {
+            eprintln!(
+                "{}",
+                "Hint: Another migration may be running. Wait and retry, or check pg_locks."
+                    .dimmed()
+            );
+        }
+        WaypointError::SimulationFailed { .. } => {
+            eprintln!(
+                "{}",
+                "Hint: Fix the SQL errors shown above before running the actual migration."
+                    .dimmed()
+            );
+        }
+        WaypointError::BaselineExists => {
+            eprintln!(
+                "{}",
+                "Hint: A baseline already exists. Use 'waypoint info' to see the current state."
+                    .dimmed()
+            );
+        }
+        WaypointError::DatabaseNotFound { .. } => {
+            eprintln!(
+                "{}",
+                "Hint: Check the database name in --database flag or [[databases]] config."
+                    .dimmed()
+            );
+        }
+        WaypointError::MigrationParseError(_) => {
+            eprintln!(
+                "{}",
+                "Hint: Check migration filenames follow the pattern V{version}__{description}.sql."
+                    .dimmed()
+            );
+        }
+        WaypointError::MultiDbDependencyCycle { .. } | WaypointError::MultiDbError { .. } => {
+            eprintln!(
+                "{}",
+                "Hint: Check [[databases]] dependency configuration in waypoint.toml.".dimmed()
+            );
+        }
+        // Remaining errors with no specific guidance
+        WaypointError::UpdateError(_)
+        | WaypointError::DiffFailed { .. }
+        | WaypointError::SnapshotError { .. }
+        | WaypointError::GitError(_)
+        | WaypointError::AdvisorError(_)
+        | WaypointError::IoError(_) => {}
     }
 }

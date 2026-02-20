@@ -147,21 +147,51 @@ fn download_and_replace(version: &str) -> Result<(), WaypointError> {
             .map_err(|e| WaypointError::UpdateError(format!("Failed to set permissions: {e}")))?;
     }
 
-    // Persist (disables auto-cleanup) and rename atomically
+    // Validate the downloaded binary by running --version on it
     let tmp_path = tmp.into_temp_path();
-    tmp_path.persist(&current_exe).map_err(|e| {
-        WaypointError::UpdateError(format!("Failed to replace binary: {e}"))
-    })?;
+    let output = std::process::Command::new(AsRef::<std::path::Path>::as_ref(&tmp_path))
+        .arg("--version")
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            // Binary is valid, proceed with replacement
+        }
+        _ => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(WaypointError::UpdateError(
+                "Downloaded binary failed validation (--version check)".into(),
+            ));
+        }
+    }
+
+    // Create a backup of the current binary before replacing
+    let backup_path = current_exe.with_extension("backup");
+    if current_exe.exists() {
+        fs::copy(&current_exe, &backup_path).map_err(|e| {
+            WaypointError::UpdateError(format!("Failed to create backup of current binary: {e}"))
+        })?;
+    }
+
+    // Persist (disables auto-cleanup) and rename atomically
+    if let Err(e) = tmp_path.persist(&current_exe) {
+        // Try to restore from backup
+        if backup_path.exists() {
+            let _ = fs::rename(&backup_path, &current_exe);
+        }
+        return Err(WaypointError::UpdateError(format!(
+            "Failed to replace binary: {e}"
+        )));
+    }
+
+    // Success — remove backup
+    let _ = fs::remove_file(&backup_path);
 
     Ok(())
 }
 
 /// Fall back to the remote install.sh script when direct update fails.
 fn fallback_install_sh() -> Result<(), WaypointError> {
-    eprintln!(
-        "{}",
-        "Falling back to install.sh...".yellow()
-    );
+    eprintln!("{}", "Falling back to install.sh...".yellow());
     let status = Command::new("sh")
         .arg("-c")
         .arg(format!("curl -sSf {INSTALL_SH_URL} | sh"))
@@ -182,18 +212,16 @@ pub fn self_update(check_only: bool, json_output: bool) -> Result<(), WaypointEr
     let release = fetch_latest_release()?;
     let latest = parse_version(&release.tag_name)?;
 
-    if json_output {
-        if check_only {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "current_version": current.to_string(),
-                    "latest_version": latest.to_string(),
-                    "update_available": latest > current,
-                })
-            );
-            return Ok(());
-        }
+    if json_output && check_only {
+        println!(
+            "{}",
+            serde_json::json!({
+                "current_version": current.to_string(),
+                "latest_version": latest.to_string(),
+                "update_available": latest > current,
+            })
+        );
+        return Ok(());
     }
 
     if current >= latest {
@@ -249,19 +277,11 @@ pub fn self_update(check_only: bool, json_output: bool) -> Result<(), WaypointEr
                     })
                 );
             } else {
-                eprintln!(
-                    "{} Successfully updated to {}.",
-                    "✓".green().bold(),
-                    latest
-                );
+                eprintln!("{} Successfully updated to {}.", "✓".green().bold(), latest);
             }
         }
         Err(e) => {
-            eprintln!(
-                "{} Direct update failed: {}",
-                "✗".red().bold(),
-                e
-            );
+            eprintln!("{} Direct update failed: {}", "✗".red().bold(), e);
             fallback_install_sh()?;
             if json_output {
                 println!(
@@ -275,10 +295,7 @@ pub fn self_update(check_only: bool, json_output: bool) -> Result<(), WaypointEr
                     })
                 );
             } else {
-                eprintln!(
-                    "{} Updated via install.sh.",
-                    "✓".green().bold()
-                );
+                eprintln!("{} Updated via install.sh.", "✓".green().bold());
             }
         }
     }

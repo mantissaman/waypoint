@@ -103,7 +103,12 @@ pub fn execute(locations: &[PathBuf], base_branch: &str) -> Result<ConflictRepor
 
 fn git_added_files(from: &str, to: &str) -> Result<Vec<String>> {
     let output = Command::new("git")
-        .args(["diff", "--name-only", "--diff-filter=A", &format!("{}...{}", from, to)])
+        .args([
+            "diff",
+            "--name-only",
+            "--diff-filter=A",
+            &format!("{}...{}", from, to),
+        ])
         .output()
         .map_err(|e| WaypointError::GitError(format!("Failed to run git: {}", e)))?;
 
@@ -130,12 +135,9 @@ fn filter_migration_files(files: &[String], locations: &[PathBuf]) -> Vec<String
             let path = PathBuf::from(f);
             // Check if file is in one of the configured locations
             locations.iter().any(|loc| path.starts_with(loc))
-                || path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| {
-                        (n.starts_with('V') || n.starts_with('R')) && n.ends_with(".sql")
-                    })
+                || path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    (n.starts_with('V') || n.starts_with('R')) && n.ends_with(".sql")
+                })
         })
         .cloned()
         .collect()
@@ -178,9 +180,7 @@ fn check_semantic_conflict(file_a: &str, file_b: &str) -> Option<Conflict> {
             crate::sql_parser::DdlOperation::AlterTableAlterColumn { table, column } => {
                 Some(format!("{}.{}", table, column))
             }
-            crate::sql_parser::DdlOperation::CreateTable { table, .. } => {
-                Some(table.clone())
-            }
+            crate::sql_parser::DdlOperation::CreateTable { table, .. } => Some(table.clone()),
             _ => None,
         })
         .collect();
@@ -197,9 +197,7 @@ fn check_semantic_conflict(file_a: &str, file_b: &str) -> Option<Conflict> {
             crate::sql_parser::DdlOperation::AlterTableAlterColumn { table, column } => {
                 Some(format!("{}.{}", table, column))
             }
-            crate::sql_parser::DdlOperation::CreateTable { table, .. } => {
-                Some(table.clone())
-            }
+            crate::sql_parser::DdlOperation::CreateTable { table, .. } => Some(table.clone()),
             _ => None,
         })
         .collect();

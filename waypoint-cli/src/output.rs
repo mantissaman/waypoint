@@ -155,8 +155,7 @@ pub fn print_undo_summary(report: &waypoint_core::UndoReport) {
     if report.migrations_undone == 0 {
         println!(
             "{}",
-            "No migrations to undo. Schema is already at its earliest state."
-                .green()
+            "No migrations to undo. Schema is already at its earliest state.".green()
         );
         return;
     }
@@ -235,10 +234,7 @@ pub fn print_lint_report(report: &waypoint_core::LintReport) {
             }
         };
 
-        let line_info = issue
-            .line
-            .map(|l| format!(":{}", l))
-            .unwrap_or_default();
+        let line_info = issue.line.map(|l| format!(":{}", l)).unwrap_or_default();
 
         println!(
             "  {} {}{} {}",
@@ -320,8 +316,7 @@ pub fn print_drift_report(report: &waypoint_core::DriftReport) {
     println!();
     println!(
         "{}",
-        "Hint: Run 'waypoint diff' to generate a migration that resolves this drift."
-            .dimmed()
+        "Hint: Run 'waypoint diff' to generate a migration that resolves this drift.".dimmed()
     );
 }
 
@@ -430,12 +425,7 @@ pub fn print_explain_report(report: &waypoint_core::ExplainReport) {
 
     for migration in &report.migrations {
         let version = migration.version.as_deref().unwrap_or("(repeatable)");
-        println!(
-            "  {} {} [{}]",
-            "→".yellow(),
-            version,
-            migration.script
-        );
+        println!("  {} {} [{}]", "→".yellow(), version, migration.script);
 
         for (i, stmt) in migration.statements.iter().enumerate() {
             let prefix = format!("    [{}/{}]", i + 1, migration.statements.len());
@@ -474,9 +464,12 @@ pub fn print_conflict_report(report: &waypoint_core::ConflictReport) {
     if !report.has_conflicts {
         println!(
             "{}",
-            format!("No migration conflicts detected against '{}'.", report.base_branch)
-                .green()
-                .bold()
+            format!(
+                "No migration conflicts detected against '{}'.",
+                report.base_branch
+            )
+            .green()
+            .bold()
         );
         return;
     }
@@ -502,7 +495,10 @@ pub fn print_conflict_report(report: &waypoint_core::ConflictReport) {
                 "!~".yellow().bold()
             }
         };
-        println!("  {} {} — {}", icon, conflict.conflict_type, conflict.description);
+        println!(
+            "  {} {} — {}",
+            icon, conflict.conflict_type, conflict.description
+        );
         for file in &conflict.files {
             println!("    {} {}", "→".dimmed(), file);
         }
@@ -523,16 +519,16 @@ pub fn print_multi_result(result: &waypoint_core::multi::MultiResult) {
     if result.all_succeeded {
         println!(
             "{}",
-            format!("All {} database(s) migrated successfully.", result.results.len())
-                .green()
-                .bold()
+            format!(
+                "All {} database(s) migrated successfully.",
+                result.results.len()
+            )
+            .green()
+            .bold()
         );
     } else {
         let failed = result.results.iter().filter(|r| !r.success).count();
-        println!(
-            "{}",
-            format!("{} database(s) failed.", failed).red().bold()
-        );
+        println!("{}", format!("{} database(s) failed.", failed).red().bold());
     }
 }
 
@@ -542,5 +538,158 @@ pub fn print_multi_info(all_info: &HashMap<String, Vec<MigrationInfo>>) {
         println!("{}", format!("=== {} ===", name).bold());
         print_info_table(infos);
         println!();
+    }
+}
+
+/// Print a safety analysis report for a single migration.
+pub fn print_safety_report(report: &waypoint_core::SafetyReport) {
+    let verdict_str = match report.overall_verdict {
+        waypoint_core::safety::SafetyVerdict::Safe => "SAFE".green().bold(),
+        waypoint_core::safety::SafetyVerdict::Caution => "CAUTION".yellow().bold(),
+        waypoint_core::safety::SafetyVerdict::Danger => "DANGER".red().bold(),
+    };
+
+    println!(
+        "  {} [{}] {}",
+        verdict_str, report.script, report.overall_verdict
+    );
+
+    for stmt in &report.statements {
+        let icon = match stmt.verdict {
+            waypoint_core::safety::SafetyVerdict::Safe => "✓".green(),
+            waypoint_core::safety::SafetyVerdict::Caution => "!".yellow(),
+            waypoint_core::safety::SafetyVerdict::Danger => "✗".red(),
+        };
+        let table_info = stmt
+            .affected_table
+            .as_ref()
+            .map(|t| {
+                let size = stmt
+                    .estimated_rows
+                    .map(|r| format!(" (~{} rows)", r))
+                    .unwrap_or_default();
+                format!(" on {}{}", t, size)
+            })
+            .unwrap_or_default();
+
+        println!(
+            "    {} {} — {}{}",
+            icon, stmt.statement_preview, stmt.lock_level, table_info
+        );
+
+        if stmt.data_loss {
+            println!(
+                "      {} {}",
+                "⚠".red(),
+                "Data loss: operation is irreversible".red()
+            );
+        }
+
+        for suggestion in &stmt.suggestions {
+            println!("      {} {}", "→".dimmed(), suggestion.dimmed());
+        }
+    }
+}
+
+/// Print the overall safety verdict.
+pub fn print_safety_overall(verdict: waypoint_core::safety::SafetyVerdict) {
+    let msg = match verdict {
+        waypoint_core::safety::SafetyVerdict::Safe => {
+            "Overall: SAFE — all migrations can proceed safely."
+                .green()
+                .bold()
+        }
+        waypoint_core::safety::SafetyVerdict::Caution => {
+            "Overall: CAUTION — some migrations require attention."
+                .yellow()
+                .bold()
+        }
+        waypoint_core::safety::SafetyVerdict::Danger => {
+            "Overall: DANGER — some migrations are high risk. Use --force to override."
+                .red()
+                .bold()
+        }
+    };
+    println!("\n{}", msg);
+}
+
+/// Print advisor report.
+pub fn print_advisor_report(report: &waypoint_core::AdvisorReport) {
+    if report.advisories.is_empty() {
+        println!(
+            "{}",
+            format!("Schema '{}' looks good. No advisories.", report.schema)
+                .green()
+                .bold()
+        );
+        return;
+    }
+
+    println!(
+        "{}",
+        format!(
+            "Schema '{}': {} advisory(ies) ({} warning, {} suggestion, {} info)",
+            report.schema,
+            report.advisories.len(),
+            report.warning_count,
+            report.suggestion_count,
+            report.info_count
+        )
+        .bold()
+    );
+    println!();
+
+    for advisory in &report.advisories {
+        let severity = match advisory.severity {
+            waypoint_core::advisor::AdvisorySeverity::Warning => {
+                format!("[{}]", advisory.rule_id).red().bold().to_string()
+            }
+            waypoint_core::advisor::AdvisorySeverity::Suggestion => {
+                format!("[{}]", advisory.rule_id)
+                    .yellow()
+                    .bold()
+                    .to_string()
+            }
+            waypoint_core::advisor::AdvisorySeverity::Info => {
+                format!("[{}]", advisory.rule_id).blue().to_string()
+            }
+        };
+
+        println!(
+            "  {} {} — {} ({})",
+            severity, advisory.object, advisory.explanation, advisory.category
+        );
+
+        if let Some(ref fix) = advisory.fix_sql {
+            println!("    {} {}", "fix:".dimmed(), fix.dimmed());
+        }
+    }
+}
+
+/// Print simulation report.
+pub fn print_simulation_report(report: &waypoint_core::SimulationReport) {
+    if report.passed {
+        println!(
+            "{}",
+            format!(
+                "Simulation passed: {} migration(s) applied successfully in temp schema.",
+                report.migrations_simulated
+            )
+            .green()
+            .bold()
+        );
+    } else {
+        println!(
+            "{}",
+            format!(
+                "Simulation FAILED: {} error(s) in temp schema.",
+                report.errors.len()
+            )
+            .red()
+            .bold()
+        );
+        for error in &report.errors {
+            println!("  {} {} — {}", "✗".red(), error.script, error.error);
+        }
     }
 }

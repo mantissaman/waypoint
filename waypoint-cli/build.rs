@@ -11,7 +11,10 @@ fn main() {
                 None
             }
         })
-        .unwrap_or_else(|| "unknown".to_string());
+        .unwrap_or_else(|| {
+            println!("cargo:warning=Git not available, using GIT_HASH=unknown");
+            "unknown".to_string()
+        });
     println!("cargo:rustc-env=GIT_HASH={}", git_hash.trim());
 
     // Build timestamp

@@ -121,7 +121,10 @@ pub enum DdlOperation {
 impl std::fmt::Display for DdlOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DdlOperation::CreateTable { table, if_not_exists } => {
+            DdlOperation::CreateTable {
+                table,
+                if_not_exists,
+            } => {
                 if *if_not_exists {
                     write!(f, "CREATE TABLE IF NOT EXISTS {}", table)
                 } else {
@@ -129,8 +132,17 @@ impl std::fmt::Display for DdlOperation {
                 }
             }
             DdlOperation::DropTable { table } => write!(f, "DROP TABLE {}", table),
-            DdlOperation::AlterTableAddColumn { table, column, data_type, .. } => {
-                write!(f, "ALTER TABLE {} ADD COLUMN {} {}", table, column, data_type)
+            DdlOperation::AlterTableAddColumn {
+                table,
+                column,
+                data_type,
+                ..
+            } => {
+                write!(
+                    f,
+                    "ALTER TABLE {} ADD COLUMN {} {}",
+                    table, column, data_type
+                )
             }
             DdlOperation::AlterTableDropColumn { table, column } => {
                 write!(f, "ALTER TABLE {} DROP COLUMN {}", table, column)
@@ -138,13 +150,25 @@ impl std::fmt::Display for DdlOperation {
             DdlOperation::AlterTableAlterColumn { table, column } => {
                 write!(f, "ALTER TABLE {} ALTER COLUMN {}", table, column)
             }
-            DdlOperation::CreateIndex { name, table, is_unique, is_concurrent } => {
+            DdlOperation::CreateIndex {
+                name,
+                table,
+                is_unique,
+                is_concurrent,
+            } => {
                 let unique = if *is_unique { "UNIQUE " } else { "" };
                 let concurrent = if *is_concurrent { "CONCURRENTLY " } else { "" };
-                write!(f, "CREATE {}{}INDEX {} ON {}", unique, concurrent, name, table)
+                write!(
+                    f,
+                    "CREATE {}{}INDEX {} ON {}",
+                    unique, concurrent, name, table
+                )
             }
             DdlOperation::DropIndex { name } => write!(f, "DROP INDEX {}", name),
-            DdlOperation::CreateView { name, is_materialized } => {
+            DdlOperation::CreateView {
+                name,
+                is_materialized,
+            } => {
                 if *is_materialized {
                     write!(f, "CREATE MATERIALIZED VIEW {}", name)
                 } else {
@@ -154,8 +178,15 @@ impl std::fmt::Display for DdlOperation {
             DdlOperation::DropView { name } => write!(f, "DROP VIEW {}", name),
             DdlOperation::CreateFunction { name } => write!(f, "CREATE FUNCTION {}", name),
             DdlOperation::DropFunction { name } => write!(f, "DROP FUNCTION {}", name),
-            DdlOperation::AddConstraint { table, constraint_type } => {
-                write!(f, "ALTER TABLE {} ADD {} CONSTRAINT", table, constraint_type)
+            DdlOperation::AddConstraint {
+                table,
+                constraint_type,
+            } => {
+                write!(
+                    f,
+                    "ALTER TABLE {} ADD {} CONSTRAINT",
+                    table, constraint_type
+                )
             }
             DdlOperation::DropConstraint { table, name } => {
                 write!(f, "ALTER TABLE {} DROP CONSTRAINT {}", table, name)
@@ -177,11 +208,17 @@ static DROP_TABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static ALTER_TABLE_ADD_COLUMN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)ALTER\s+TABLE\s+(?:(\w+)\.)?(\w+)\s+ADD\s+(?:COLUMN\s+)?(\w+)\s+(\w[\w\s\(\),]*)").unwrap()
+    Regex::new(
+        r"(?i)ALTER\s+TABLE\s+(?:(\w+)\.)?(\w+)\s+ADD\s+(?:COLUMN\s+)?(\w+)\s+(\w[\w\s\(\),]*)",
+    )
+    .unwrap()
 });
 
 static ALTER_TABLE_DROP_COLUMN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)ALTER\s+TABLE\s+(?:(\w+)\.)?(\w+)\s+DROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?(\w+)").unwrap()
+    Regex::new(
+        r"(?i)ALTER\s+TABLE\s+(?:(\w+)\.)?(\w+)\s+DROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?(\w+)",
+    )
+    .unwrap()
 });
 
 static ALTER_TABLE_ALTER_COLUMN_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -193,11 +230,13 @@ static CREATE_INDEX_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static DROP_INDEX_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)DROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?(?:(\w+)\.)?(\w+)").unwrap()
+    Regex::new(r"(?i)DROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?(?:(\w+)\.)?(\w+)")
+        .unwrap()
 });
 
 static CREATE_VIEW_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)CREATE\s+(?:OR\s+REPLACE\s+)?(MATERIALIZED\s+)?VIEW\s+(?:(\w+)\.)?(\w+)").unwrap()
+    Regex::new(r"(?i)CREATE\s+(?:OR\s+REPLACE\s+)?(MATERIALIZED\s+)?VIEW\s+(?:(\w+)\.)?(\w+)")
+        .unwrap()
 });
 
 static DROP_VIEW_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -217,16 +256,17 @@ static ADD_CONSTRAINT_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static DROP_CONSTRAINT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)ALTER\s+TABLE\s+(?:(\w+)\.)?(\w+)\s+DROP\s+CONSTRAINT\s+(?:IF\s+EXISTS\s+)?(\w+)").unwrap()
+    Regex::new(
+        r"(?i)ALTER\s+TABLE\s+(?:(\w+)\.)?(\w+)\s+DROP\s+CONSTRAINT\s+(?:IF\s+EXISTS\s+)?(\w+)",
+    )
+    .unwrap()
 });
 
-static CREATE_ENUM_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)CREATE\s+TYPE\s+(?:(\w+)\.)?(\w+)\s+AS\s+ENUM").unwrap()
-});
+static CREATE_ENUM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)CREATE\s+TYPE\s+(?:(\w+)\.)?(\w+)\s+AS\s+ENUM").unwrap());
 
-static TRUNCATE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)TRUNCATE\s+(?:TABLE\s+)?(?:(\w+)\.)?(\w+)").unwrap()
-});
+static TRUNCATE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)TRUNCATE\s+(?:TABLE\s+)?(?:(\w+)\.)?(\w+)").unwrap());
 
 /// Extract DDL operations from SQL content.
 pub fn extract_ddl_operations(sql: &str) -> Vec<DdlOperation> {
@@ -254,7 +294,10 @@ fn parse_statement(stmt: &str) -> Option<DdlOperation> {
     if let Some(caps) = ADD_CONSTRAINT_RE.captures(stmt) {
         let table = caps.get(2).unwrap().as_str().to_string();
         let constraint_type = caps.get(3).unwrap().as_str().to_uppercase();
-        return Some(DdlOperation::AddConstraint { table, constraint_type });
+        return Some(DdlOperation::AddConstraint {
+            table,
+            constraint_type,
+        });
     }
 
     // ALTER TABLE ... DROP CONSTRAINT (before DROP COLUMN)
@@ -286,7 +329,11 @@ fn parse_statement(stmt: &str) -> Option<DdlOperation> {
         let column = caps.get(3).unwrap().as_str().to_string();
         let rest = caps.get(4).unwrap().as_str();
         // Extract data type (first word)
-        let data_type = rest.split_whitespace().next().unwrap_or("unknown").to_string();
+        let data_type = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("unknown")
+            .to_string();
         let upper = stmt.to_uppercase();
         let has_default = upper.contains("DEFAULT");
         let is_not_null = upper.contains("NOT NULL");
@@ -303,7 +350,10 @@ fn parse_statement(stmt: &str) -> Option<DdlOperation> {
     if let Some(caps) = CREATE_TABLE_RE.captures(stmt) {
         let if_not_exists = caps.get(1).is_some();
         let table = caps.get(3).unwrap().as_str().to_string();
-        return Some(DdlOperation::CreateTable { table, if_not_exists });
+        return Some(DdlOperation::CreateTable {
+            table,
+            if_not_exists,
+        });
     }
 
     // DROP TABLE
@@ -336,7 +386,10 @@ fn parse_statement(stmt: &str) -> Option<DdlOperation> {
     if let Some(caps) = CREATE_VIEW_RE.captures(stmt) {
         let is_materialized = caps.get(1).is_some();
         let name = caps.get(3).unwrap().as_str().to_string();
-        return Some(DdlOperation::CreateView { name, is_materialized });
+        return Some(DdlOperation::CreateView {
+            name,
+            is_materialized,
+        });
     }
 
     // DROP VIEW
@@ -422,13 +475,21 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
                 }
                 continue;
             }
-            // String literal
+            // String literal (standard or E'...' escape string)
             b'\'' => {
+                // Check if this is an E'...' escape string
+                let is_escape_string = i > 0
+                    && (bytes[i - 1] == b'E' || bytes[i - 1] == b'e')
+                    && (i < 2 || !(bytes[i - 2].is_ascii_alphanumeric() || bytes[i - 2] == b'_'));
                 i += 1;
                 while i < len {
+                    if is_escape_string && bytes[i] == b'\\' {
+                        i += 2; // Skip escaped character in E-string
+                        continue;
+                    }
                     if bytes[i] == b'\'' {
                         if i + 1 < len && bytes[i + 1] == b'\'' {
-                            i += 2; // escaped quote
+                            i += 2; // doubled-quote escape
                         } else {
                             i += 1;
                             break;
@@ -517,7 +578,8 @@ mod tests {
 
     #[test]
     fn test_split_respects_dollar_quoting() {
-        let sql = "CREATE FUNCTION foo() RETURNS void AS $$ BEGIN; END; $$ LANGUAGE plpgsql; SELECT 1;";
+        let sql =
+            "CREATE FUNCTION foo() RETURNS void AS $$ BEGIN; END; $$ LANGUAGE plpgsql; SELECT 1;";
         let stmts = split_statements(sql);
         assert_eq!(stmts.len(), 2);
         assert!(stmts[0].contains("BEGIN; END;"));
@@ -551,7 +613,10 @@ mod tests {
         let ops = extract_ddl_operations(sql);
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            DdlOperation::CreateTable { table, if_not_exists } => {
+            DdlOperation::CreateTable {
+                table,
+                if_not_exists,
+            } => {
                 assert_eq!(table, "users");
                 assert!(!if_not_exists);
             }
@@ -564,7 +629,10 @@ mod tests {
         let sql = "CREATE TABLE IF NOT EXISTS users (id SERIAL);";
         let ops = extract_ddl_operations(sql);
         match &ops[0] {
-            DdlOperation::CreateTable { table, if_not_exists } => {
+            DdlOperation::CreateTable {
+                table,
+                if_not_exists,
+            } => {
                 assert_eq!(table, "users");
                 assert!(if_not_exists);
             }
@@ -577,7 +645,13 @@ mod tests {
         let sql = "ALTER TABLE users ADD COLUMN email VARCHAR(255) NOT NULL DEFAULT '';";
         let ops = extract_ddl_operations(sql);
         match &ops[0] {
-            DdlOperation::AlterTableAddColumn { table, column, is_not_null, has_default, .. } => {
+            DdlOperation::AlterTableAddColumn {
+                table,
+                column,
+                is_not_null,
+                has_default,
+                ..
+            } => {
                 assert_eq!(table, "users");
                 assert_eq!(column, "email");
                 assert!(is_not_null);
@@ -592,7 +666,12 @@ mod tests {
         let sql = "CREATE UNIQUE INDEX CONCURRENTLY idx_users_email ON users (email);";
         let ops = extract_ddl_operations(sql);
         match &ops[0] {
-            DdlOperation::CreateIndex { name, table, is_concurrent, is_unique } => {
+            DdlOperation::CreateIndex {
+                name,
+                table,
+                is_concurrent,
+                is_unique,
+            } => {
                 assert_eq!(name, "idx_users_email");
                 assert_eq!(table, "users");
                 assert!(is_concurrent);
@@ -674,7 +753,10 @@ mod tests {
         let sql = "CREATE MATERIALIZED VIEW user_stats AS SELECT count(*) FROM users;";
         let ops = extract_ddl_operations(sql);
         match &ops[0] {
-            DdlOperation::CreateView { name, is_materialized } => {
+            DdlOperation::CreateView {
+                name,
+                is_materialized,
+            } => {
                 assert_eq!(name, "user_stats");
                 assert!(is_materialized);
             }
@@ -692,6 +774,49 @@ mod tests {
     #[test]
     fn test_escaped_string_quotes() {
         let sql = "SELECT 'it''s; here'; SELECT 2;";
+        let stmts = split_statements(sql);
+        assert_eq!(stmts.len(), 2);
+    }
+
+    #[test]
+    fn test_split_respects_e_escape_strings() {
+        let sql = r"SELECT E'hello\';world'; SELECT 2;";
+        let stmts = split_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains(r"E'hello\';world'"));
+    }
+
+    #[test]
+    fn test_split_e_string_with_backslash() {
+        let sql = r"SELECT E'it\'s a test; really'; SELECT 1;";
+        let stmts = split_statements(sql);
+        assert_eq!(stmts.len(), 2);
+    }
+
+    #[test]
+    fn test_split_nested_block_comments() {
+        let sql = "SELECT /* outer /* inner */ outer */ 1; SELECT 2;";
+        let stmts = split_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[1], "SELECT 2");
+    }
+
+    #[test]
+    fn test_split_whitespace_only() {
+        let stmts = split_statements("   \n\t  ");
+        assert!(stmts.is_empty());
+    }
+
+    #[test]
+    fn test_split_comment_only() {
+        let stmts = split_statements("-- just a comment\n");
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "-- just a comment");
+    }
+
+    #[test]
+    fn test_split_mixed_e_and_regular_strings() {
+        let sql = r"SELECT 'normal;string', E'escape\';string'; SELECT 2;";
         let stmts = split_statements(sql);
         assert_eq!(stmts.len(), 2);
     }

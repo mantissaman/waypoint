@@ -14,6 +14,26 @@ pub struct MigrationDirectives {
     pub depends: Vec<String>,
     /// Environment tags: `-- waypoint:env dev,staging`
     pub env: Vec<String>,
+    /// Preconditions: `-- waypoint:require table_exists("users")`
+    pub require: Vec<String>,
+    /// Postconditions: `-- waypoint:ensure column_exists("users", "email")`
+    pub ensure: Vec<String>,
+    /// Safety override: `-- waypoint:safety-override` bypasses DANGER blocks
+    pub safety_override: bool,
+}
+
+/// Strip a directive prefix, ensuring the prefix is followed by whitespace or end of string.
+/// This prevents prefix collisions like "waypoint:env" matching "waypoint:environment".
+fn strip_directive_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    if let Some(rest) = line.strip_prefix(prefix) {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            Some(rest.trim())
+        } else {
+            None
+        }
+    } else {
+        None
+    }
 }
 
 /// Parse `-- waypoint:*` directives from SQL content.
@@ -38,8 +58,7 @@ pub fn parse_directives(sql: &str) -> MigrationDirectives {
 
         let comment_body = trimmed.strip_prefix("--").unwrap().trim();
 
-        if let Some(value) = comment_body.strip_prefix("waypoint:depends") {
-            let value = value.trim();
+        if let Some(value) = strip_directive_prefix(comment_body, "waypoint:depends") {
             for item in value.split(',') {
                 let item = item.trim();
                 if !item.is_empty() {
@@ -48,14 +67,23 @@ pub fn parse_directives(sql: &str) -> MigrationDirectives {
                     directives.depends.push(version.to_string());
                 }
             }
-        } else if let Some(value) = comment_body.strip_prefix("waypoint:env") {
-            let value = value.trim();
+        } else if let Some(value) = strip_directive_prefix(comment_body, "waypoint:env") {
             for item in value.split(',') {
                 let item = item.trim();
                 if !item.is_empty() {
                     directives.env.push(item.to_string());
                 }
             }
+        } else if let Some(value) = strip_directive_prefix(comment_body, "waypoint:require") {
+            if !value.is_empty() {
+                directives.require.push(value.to_string());
+            }
+        } else if let Some(value) = strip_directive_prefix(comment_body, "waypoint:ensure") {
+            if !value.is_empty() {
+                directives.ensure.push(value.to_string());
+            }
+        } else if comment_body.trim() == "waypoint:safety-override" {
+            directives.safety_override = true;
         }
     }
 
@@ -137,5 +165,80 @@ mod tests {
     fn test_no_env_runs_everywhere() {
         let d = MigrationDirectives::default();
         assert!(d.env.is_empty());
+    }
+
+    #[test]
+    fn test_parse_require_directive() {
+        let sql = "-- waypoint:require table_exists(\"users\")\nCREATE TABLE foo();";
+        let d = parse_directives(sql);
+        assert_eq!(d.require, vec!["table_exists(\"users\")"]);
+    }
+
+    #[test]
+    fn test_parse_ensure_directive() {
+        let sql = "-- waypoint:ensure column_exists(\"users\", \"email\")\nALTER TABLE users ADD COLUMN email TEXT;";
+        let d = parse_directives(sql);
+        assert_eq!(d.ensure, vec!["column_exists(\"users\", \"email\")"]);
+    }
+
+    #[test]
+    fn test_parse_multiple_guards() {
+        let sql = "-- waypoint:require table_exists(\"users\")\n-- waypoint:require NOT column_exists(\"users\", \"email\")\n-- waypoint:ensure column_exists(\"users\", \"email\")\nALTER TABLE users ADD COLUMN email TEXT;";
+        let d = parse_directives(sql);
+        assert_eq!(d.require.len(), 2);
+        assert_eq!(d.ensure.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_safety_override() {
+        let sql = "-- waypoint:safety-override\nALTER TABLE large_table ADD COLUMN foo TEXT;";
+        let d = parse_directives(sql);
+        assert!(d.safety_override);
+    }
+
+    #[test]
+    fn test_safety_override_default_false() {
+        let sql = "CREATE TABLE foo();";
+        let d = parse_directives(sql);
+        assert!(!d.safety_override);
+    }
+
+    #[test]
+    fn test_env_prefix_does_not_match_ensure() {
+        let sql = "-- waypoint:ensure column_exists(\"users\", \"email\")\nALTER TABLE users ADD COLUMN email TEXT;";
+        let d = parse_directives(sql);
+        // Should be parsed as ensure, not env
+        assert!(d.env.is_empty());
+        assert_eq!(d.ensure.len(), 1);
+    }
+
+    #[test]
+    fn test_directive_prefix_boundary() {
+        // "waypoint:environment" should NOT match "waypoint:env"
+        let sql = "-- waypoint:environment prod\nCREATE TABLE foo();";
+        let d = parse_directives(sql);
+        // Should NOT be parsed as env directive since "waypoint:environment" != "waypoint:env"
+        assert!(d.env.is_empty());
+    }
+
+    #[test]
+    fn test_parse_empty_depends() {
+        let sql = "-- waypoint:depends\nCREATE TABLE foo();";
+        let d = parse_directives(sql);
+        assert!(d.depends.is_empty());
+    }
+
+    #[test]
+    fn test_parse_empty_env() {
+        let sql = "-- waypoint:env\nCREATE TABLE foo();";
+        let d = parse_directives(sql);
+        assert!(d.env.is_empty());
+    }
+
+    #[test]
+    fn test_parse_require_with_special_chars() {
+        let sql = "-- waypoint:require table_exists(\"my-table\")\nCREATE TABLE foo();";
+        let d = parse_directives(sql);
+        assert_eq!(d.require, vec!["table_exists(\"my-table\")"]);
     }
 }

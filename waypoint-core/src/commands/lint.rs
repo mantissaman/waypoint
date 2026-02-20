@@ -68,6 +68,8 @@ pub struct LintReport {
 pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintReport> {
     let migrations = scan_migrations(locations)?;
     let mut issues = Vec::new();
+    let disabled: std::collections::HashSet<&str> =
+        disabled_rules.iter().map(|s| s.as_str()).collect();
 
     let files_checked = migrations.len();
 
@@ -81,13 +83,11 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
         let script = &migration.script;
 
         // I001: File contains only comments or whitespace
-        if !disabled_rules.contains(&"I001".to_string()) {
-            let meaningful = sql
-                .lines()
-                .any(|l| {
-                    let t = l.trim();
-                    !t.is_empty() && !t.starts_with("--")
-                });
+        if !disabled.contains("I001") {
+            let meaningful = sql.lines().any(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with("--")
+            });
             if !meaningful {
                 issues.push(LintIssue {
                     rule_id: "I001".to_string(),
@@ -104,6 +104,9 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
         let ops = extract_ddl_operations(sql);
         let statements = split_statements(sql);
 
+        // Pre-compute uppercase SQL once per migration for case-insensitive checks
+        let upper = sql.to_uppercase();
+
         for op in &ops {
             match op {
                 // W001: CREATE TABLE without IF NOT EXISTS
@@ -111,17 +114,17 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                     table,
                     if_not_exists,
                 } if !if_not_exists => {
-                    if !disabled_rules.contains(&"W001".to_string()) {
+                    if !disabled.contains("W001") {
                         issues.push(LintIssue {
                             rule_id: "W001".to_string(),
                             severity: LintSeverity::Warning,
-                            message: format!(
-                                "CREATE TABLE {} without IF NOT EXISTS",
-                                table
-                            ),
+                            message: format!("CREATE TABLE {} without IF NOT EXISTS", table),
                             script: script.clone(),
-                            line: find_line(sql, "CREATE TABLE"),
-                            suggestion: Some("Use CREATE TABLE IF NOT EXISTS to make migration re-runnable".to_string()),
+                            line: find_line(sql, &upper, "CREATE TABLE"),
+                            suggestion: Some(
+                                "Use CREATE TABLE IF NOT EXISTS to make migration re-runnable"
+                                    .to_string(),
+                            ),
                         });
                     }
                 }
@@ -132,7 +135,7 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                     is_concurrent,
                     ..
                 } if !is_concurrent => {
-                    if !disabled_rules.contains(&"W002".to_string()) {
+                    if !disabled.contains("W002") {
                         issues.push(LintIssue {
                             rule_id: "W002".to_string(),
                             severity: LintSeverity::Warning,
@@ -141,7 +144,7 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                                 name
                             ),
                             script: script.clone(),
-                            line: find_line(sql, "CREATE INDEX"),
+                            line: find_line(sql, &upper, "CREATE INDEX"),
                             suggestion: Some("Use CREATE INDEX CONCURRENTLY to avoid blocking writes".to_string()),
                         });
                     }
@@ -155,7 +158,7 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                     has_default,
                     ..
                 } if *is_not_null && !has_default => {
-                    if !disabled_rules.contains(&"E001".to_string()) {
+                    if !disabled.contains("E001") {
                         issues.push(LintIssue {
                             rule_id: "E001".to_string(),
                             severity: LintSeverity::Error,
@@ -164,7 +167,7 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                                 table, column
                             ),
                             script: script.clone(),
-                            line: find_line(sql, "ADD"),
+                            line: find_line(sql, &upper, "ADD"),
                             suggestion: Some("Add a DEFAULT value or make the column nullable".to_string()),
                         });
                     }
@@ -172,9 +175,8 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
 
                 // W003: ALTER COLUMN TYPE (full table rewrite + lock)
                 DdlOperation::AlterTableAlterColumn { table, column } => {
-                    if !disabled_rules.contains(&"W003".to_string()) {
-                        // Check if it's a TYPE change
-                        let upper = sql.to_uppercase();
+                    if !disabled.contains("W003") {
+                        // Check if it's a TYPE change (uses pre-computed uppercase)
                         if upper.contains("TYPE") {
                             issues.push(LintIssue {
                                 rule_id: "W003".to_string(),
@@ -184,7 +186,7 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                                     table, column
                                 ),
                                 script: script.clone(),
-                                line: find_line(sql, "ALTER COLUMN"),
+                                line: find_line(sql, &upper, "ALTER COLUMN"),
                                 suggestion: Some("Consider a multi-step approach: add new column, backfill, swap".to_string()),
                             });
                         }
@@ -193,19 +195,24 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
 
                 // W004: DROP TABLE / DROP COLUMN (destructive)
                 DdlOperation::DropTable { table } => {
-                    if !disabled_rules.contains(&"W004".to_string()) {
+                    if !disabled.contains("W004") {
                         issues.push(LintIssue {
                             rule_id: "W004".to_string(),
                             severity: LintSeverity::Warning,
-                            message: format!("DROP TABLE {} is destructive and irreversible", table),
+                            message: format!(
+                                "DROP TABLE {} is destructive and irreversible",
+                                table
+                            ),
                             script: script.clone(),
-                            line: find_line(sql, "DROP TABLE"),
-                            suggestion: Some("Ensure you have a backup or undo migration".to_string()),
+                            line: find_line(sql, &upper, "DROP TABLE"),
+                            suggestion: Some(
+                                "Ensure you have a backup or undo migration".to_string(),
+                            ),
                         });
                     }
                 }
                 DdlOperation::AlterTableDropColumn { table, column } => {
-                    if !disabled_rules.contains(&"W004".to_string()) {
+                    if !disabled.contains("W004") {
                         issues.push(LintIssue {
                             rule_id: "W004".to_string(),
                             severity: LintSeverity::Warning,
@@ -214,8 +221,10 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                                 table, column
                             ),
                             script: script.clone(),
-                            line: find_line(sql, "DROP COLUMN"),
-                            suggestion: Some("Ensure you have a backup or undo migration".to_string()),
+                            line: find_line(sql, &upper, "DROP COLUMN"),
+                            suggestion: Some(
+                                "Ensure you have a backup or undo migration".to_string(),
+                            ),
                         });
                     }
                 }
@@ -227,10 +236,13 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                     has_default,
                     ..
                 } if *has_default => {
-                    if !disabled_rules.contains(&"W006".to_string()) {
-                        // Heuristic: check for function calls in DEFAULT
-                        let upper = sql.to_uppercase();
-                        if upper.contains("DEFAULT") && (upper.contains("RANDOM()") || upper.contains("GEN_RANDOM_UUID()") || upper.contains("NOW()")) {
+                    if !disabled.contains("W006") {
+                        // Heuristic: check for function calls in DEFAULT (uses pre-computed uppercase)
+                        if upper.contains("DEFAULT")
+                            && (upper.contains("RANDOM()")
+                                || upper.contains("GEN_RANDOM_UUID()")
+                                || upper.contains("NOW()"))
+                        {
                             issues.push(LintIssue {
                                 rule_id: "W006".to_string(),
                                 severity: LintSeverity::Warning,
@@ -239,7 +251,7 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                                     table, column
                                 ),
                                 script: script.clone(),
-                                line: find_line(sql, "DEFAULT"),
+                                line: find_line(sql, &upper, "DEFAULT"),
                                 suggestion: Some("On PostgreSQL < 11, volatile defaults cause a full table rewrite".to_string()),
                             });
                         }
@@ -248,7 +260,7 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
 
                 // W007: TRUNCATE TABLE
                 DdlOperation::TruncateTable { table } => {
-                    if !disabled_rules.contains(&"W007".to_string()) {
+                    if !disabled.contains("W007") {
                         issues.push(LintIssue {
                             rule_id: "W007".to_string(),
                             severity: LintSeverity::Warning,
@@ -257,7 +269,7 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                                 table
                             ),
                             script: script.clone(),
-                            line: find_line(sql, "TRUNCATE"),
+                            line: find_line(sql, &upper, "TRUNCATE"),
                             suggestion: Some("Ensure this is intentional and the table can be locked exclusively".to_string()),
                         });
                     }
@@ -268,14 +280,16 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
         }
 
         // E002: Multiple DDL statements without explicit transaction control
-        if !disabled_rules.contains(&"E002".to_string()) {
+        if !disabled.contains("E002") {
             let ddl_count = ops
                 .iter()
                 .filter(|op| !matches!(op, DdlOperation::Other { .. }))
                 .count();
-            let has_begin = statements
-                .iter()
-                .any(|s| s.trim().to_uppercase().starts_with("BEGIN"));
+            let has_begin = statements.iter().any(|s| {
+                s.trim()
+                    .get(..5)
+                    .is_some_and(|w| w.eq_ignore_ascii_case("BEGIN"))
+            });
             if ddl_count > 1 && !has_begin {
                 // This is a warning because waypoint wraps in a transaction by default
                 issues.push(LintIssue {
@@ -316,12 +330,12 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
 }
 
 /// Find the approximate line number of a pattern in SQL content.
-fn find_line(sql: &str, pattern: &str) -> Option<usize> {
-    let upper_sql = sql.to_uppercase();
-    let upper_pattern = pattern.to_uppercase();
-    upper_sql.find(&upper_pattern).map(|offset| {
-        sql[..offset].lines().count()
-    })
+///
+/// Accepts the pre-computed uppercase SQL to avoid re-allocating.
+fn find_line(sql: &str, upper_sql: &str, pattern: &str) -> Option<usize> {
+    upper_sql
+        .find(pattern)
+        .map(|offset| sql[..offset].lines().count())
 }
 
 #[cfg(test)]
@@ -396,22 +410,14 @@ mod tests {
             "CREATE TABLE users (id SERIAL PRIMARY KEY);",
         );
 
-        let report = execute(
-            &[dir.path().to_path_buf()],
-            &["W001".to_string()],
-        )
-        .unwrap();
+        let report = execute(&[dir.path().to_path_buf()], &["W001".to_string()]).unwrap();
         assert!(!report.issues.iter().any(|i| i.rule_id == "W001"));
     }
 
     #[test]
     fn test_lint_drop_table() {
         let dir = TempDir::new().unwrap();
-        setup_migration(
-            dir.path(),
-            "V1__Drop_old.sql",
-            "DROP TABLE old_table;",
-        );
+        setup_migration(dir.path(), "V1__Drop_old.sql", "DROP TABLE old_table;");
 
         let report = execute(&[dir.path().to_path_buf()], &[]).unwrap();
         assert!(report.issues.iter().any(|i| i.rule_id == "W004"));
@@ -420,11 +426,7 @@ mod tests {
     #[test]
     fn test_lint_empty_file() {
         let dir = TempDir::new().unwrap();
-        setup_migration(
-            dir.path(),
-            "V1__Empty.sql",
-            "-- Just a comment\n",
-        );
+        setup_migration(dir.path(), "V1__Empty.sql", "-- Just a comment\n");
 
         let report = execute(&[dir.path().to_path_buf()], &[]).unwrap();
         assert!(report.issues.iter().any(|i| i.rule_id == "I001"));
@@ -433,11 +435,7 @@ mod tests {
     #[test]
     fn test_lint_truncate() {
         let dir = TempDir::new().unwrap();
-        setup_migration(
-            dir.path(),
-            "V1__Truncate.sql",
-            "TRUNCATE TABLE users;",
-        );
+        setup_migration(dir.path(), "V1__Truncate.sql", "TRUNCATE TABLE users;");
 
         let report = execute(&[dir.path().to_path_buf()], &[]).unwrap();
         assert!(report.issues.iter().any(|i| i.rule_id == "W007"));

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build                    # Build both crates
-cargo test --lib               # Unit tests only (no DB required, 85+ tests)
+cargo test --lib               # Unit tests only (no DB required, 249 tests)
 cargo test                     # All tests (integration tests need TEST_DATABASE_URL)
 cargo clippy -- -D warnings    # Lint
 cargo fmt --check              # Format check
@@ -21,7 +21,7 @@ Single test: `cargo test --lib test_name`
 Cargo workspace with two crates:
 
 - **waypoint-core** (`waypoint-core/`) — Library crate. Public API is `Waypoint` struct in `lib.rs`. All migration logic, schema introspection, and command implementations live here.
-- **waypoint-cli** (`waypoint-cli/`) — Binary crate (`waypoint`). clap-based CLI with 16 subcommands, colored table output, self-update.
+- **waypoint-cli** (`waypoint-cli/`) — Binary crate (`waypoint`). clap-based CLI with 19 subcommands, colored table output, self-update.
 
 ### Core modules (waypoint-core/src/)
 
@@ -34,8 +34,12 @@ Cargo workspace with two crates:
 | `history.rs` | Schema history table CRUD (`waypoint_schema_history`) |
 | `db.rs` | Connection with TLS (rustls), advisory locks, transaction execution |
 | `hooks.rs` | SQL callback hooks (beforeMigrate, afterEachMigrate, etc.) |
-| `error.rs` | `WaypointError` enum (24 variants) with `thiserror` |
-| `directive.rs` | Parse `-- waypoint:env` and `-- waypoint:depends` from SQL headers |
+| `error.rs` | `WaypointError` enum (28 variants) with `thiserror` |
+| `directive.rs` | Parse `-- waypoint:*` directives (env, depends, require, ensure, safety-override) |
+| `guard.rs` | Guard expression parser + evaluator (10 built-in assertion functions) |
+| `reversal.rs` | Auto-reversal generation from schema diffs, storage/retrieval |
+| `safety.rs` | Lock analysis, impact estimation, safety verdicts (Safe/Caution/Danger) |
+| `advisor.rs` | Schema advisory rules (A001-A010), fix SQL generation |
 | `sql_parser.rs` | Regex-based DDL extraction (`DdlOperation` enum), `split_statements()` |
 | `schema.rs` | PostgreSQL introspection via `information_schema`/`pg_catalog`, diff, DDL generation |
 | `dependency.rs` | Migration dependency graph, topological sort (Kahn's algorithm) |
@@ -44,7 +48,7 @@ Cargo workspace with two crates:
 
 ### Commands (waypoint-core/src/commands/)
 
-15 command modules, one per subcommand: `migrate`, `info`, `validate`, `repair`, `baseline`, `clean`, `undo`, `lint`, `changelog`, `diff`, `drift`, `snapshot`, `explain`, `check_conflicts`, `preflight`.
+18 command modules, one per subcommand: `migrate`, `info`, `validate`, `repair`, `baseline`, `clean`, `undo`, `lint`, `changelog`, `diff`, `drift`, `snapshot`, `explain`, `check_conflicts`, `preflight`, `safety`, `advisor`, `simulate`.
 
 No-DB commands (pure file analysis): `lint`, `changelog`, `check_conflicts`.
 
@@ -52,19 +56,26 @@ No-DB commands (pure file analysis): `lint`, `changelog`, `check_conflicts`.
 
 | File | Purpose |
 |---|---|
-| `main.rs` | clap CLI with `Cli` struct, `Commands` enum, subcommand routing, exit codes 0-12 |
+| `main.rs` | clap CLI with `Cli` struct, `Commands` enum, subcommand routing, exit codes 0-15 |
 | `output.rs` | Terminal formatters using `comfy-table` + `colored` for all commands |
-| `self_update.rs` | GitHub releases API check, binary download/replace |
+| `self_update.rs` | GitHub releases API check, binary download/replace with backup+validation (feature-gated) |
 | `build.rs` | Injects `GIT_HASH` and `BUILD_TIME` at compile time |
 
 ### Key patterns
 
 - **Config resolution**: CLI > env vars > TOML > defaults (see `config.rs` `load()`)
-- **Global CLI flags**: `--json`, `--dry-run`, `--quiet`, `--verbose`, `--environment`, `--skip-preflight`, `--database`, `--fail-fast` are `global = true` in clap — work before or after subcommand
+- **Global CLI flags**: `--json`, `--dry-run`, `--quiet`, `--verbose`, `--environment`, `--skip-preflight`, `--database`, `--fail-fast`, `--force`, `--simulate`, `--no-color`, `--config/-c` are `global = true` in clap — work before or after subcommand
+- **Self-update feature-gated**: `ureq`, `semver`, `flate2`, `tar` are behind `self-update` feature (default on). Build without: `cargo build --no-default-features`
+- **Config macros**: `apply_option!` and `apply_option_some!` macros eliminate boilerplate in `config.rs`
+- **print_report! macro**: CLI uses `print_report!` macro for uniform JSON/pretty-print output
+- **Schema introspection**: Uses `tokio::try_join!()` to parallelize 9 independent queries; N+1 pattern eliminated with JOIN
 - **Multi-database mode**: Auto-detected when `config.multi_database.is_some()`. Uses Kahn's algorithm for dependency ordering.
 - **All reports are `Serialize`**: Every command returns a report struct that implements `serde::Serialize` for `--json` output
 - **Migration file types**: `V{ver}__desc.sql` (versioned), `R__desc.sql` (repeatable), `U{ver}__desc.sql` (undo)
-- **Directives**: `-- waypoint:env dev,staging` and `-- waypoint:depends V1,V3` parsed from SQL file headers by `directive.rs`
+- **Directives**: `-- waypoint:env`, `-- waypoint:depends`, `-- waypoint:require`, `-- waypoint:ensure`, `-- waypoint:safety-override` parsed from SQL file headers by `directive.rs`
+- **Guards**: `require` (preconditions) and `ensure` (postconditions) use a recursive descent parser in `guard.rs`; evaluated against live DB via information_schema/pg_catalog
+- **Auto-reversals**: `reversal.rs` captures before/after schema snapshots, generates reverse DDL, stores in `reversal_sql` column; `undo.rs` falls back to stored reversals when no U file exists
+- **Safety analysis**: `safety.rs` maps DDL → PostgreSQL lock levels, queries `pg_stat_user_tables` for row counts, produces Safe/Caution/Danger verdicts; `migrate.rs` gates DANGER migrations behind `--force`
 
 ## Config
 
@@ -74,7 +85,7 @@ Config resolution priority (highest wins):
 3. `waypoint.toml` (default path, override with `-c`)
 4. Built-in defaults
 
-Key TOML sections: `[database]`, `[migrations]`, `[lint]`, `[snapshots]`, `[preflight]`, `[hooks]`, `[placeholders]`, `[[databases]]` (multi-db array).
+Key TOML sections: `[database]`, `[migrations]`, `[lint]`, `[snapshots]`, `[preflight]`, `[hooks]`, `[placeholders]`, `[guards]`, `[reversals]`, `[safety]`, `[advisor]`, `[simulation]`, `[[databases]]` (multi-db array).
 
 ## Integration testing
 

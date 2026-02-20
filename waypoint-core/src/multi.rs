@@ -69,56 +69,61 @@ pub struct MultiResult {
 
 impl MultiWaypoint {
     /// Determine execution order based on depends_on relationships (Kahn's algorithm).
+    ///
+    /// Uses borrowed `&str` references internally to avoid cloning database names
+    /// during the topological sort; only clones into owned `String`s for the output.
     pub fn execution_order(databases: &[NamedDatabaseConfig]) -> Result<Vec<String>> {
-        let all_names: HashSet<String> = databases.iter().map(|d| d.name.clone()).collect();
+        let all_names: HashSet<&str> = databases.iter().map(|d| d.name.as_str()).collect();
 
-        // Build in-degree map
-        let mut in_degree: HashMap<String, usize> = HashMap::new();
-        let mut reverse_edges: HashMap<String, Vec<String>> = HashMap::new();
+        // Build in-degree map using borrowed names
+        let mut in_degree: HashMap<&str, usize> = HashMap::new();
+        let mut reverse_edges: HashMap<&str, Vec<&str>> = HashMap::new();
 
         for db in databases {
-            in_degree.entry(db.name.clone()).or_insert(0);
+            in_degree.entry(db.name.as_str()).or_insert(0);
             for dep in &db.depends_on {
-                if !all_names.contains(dep) {
+                if !all_names.contains(dep.as_str()) {
                     return Err(WaypointError::DatabaseNotFound {
                         name: dep.clone(),
-                        available: all_names.iter().cloned().collect::<Vec<_>>().join(", "),
+                        available: all_names.iter().copied().collect::<Vec<_>>().join(", "),
                     });
                 }
-                *in_degree.entry(db.name.clone()).or_insert(0) += 1;
+                *in_degree.entry(db.name.as_str()).or_insert(0) += 1;
                 reverse_edges
-                    .entry(dep.clone())
+                    .entry(dep.as_str())
                     .or_default()
-                    .push(db.name.clone());
+                    .push(db.name.as_str());
             }
         }
 
-        let mut queue: VecDeque<String> = VecDeque::new();
-        for (name, deg) in &in_degree {
-            if *deg == 0 {
-                queue.push_back(name.clone());
+        let mut queue: VecDeque<&str> = VecDeque::new();
+        for (&name, &deg) in &in_degree {
+            if deg == 0 {
+                queue.push_back(name);
             }
         }
 
         let mut sorted = Vec::new();
         while let Some(name) = queue.pop_front() {
-            sorted.push(name.clone());
-            if let Some(dependents) = reverse_edges.get(&name) {
-                for dep in dependents {
-                    let deg = in_degree.get_mut(dep).unwrap();
+            sorted.push(name.to_string());
+            if let Some(dependents) = reverse_edges.get(name) {
+                for &dep in dependents {
+                    let deg = in_degree
+                        .get_mut(dep)
+                        .expect("dependency not found in in_degree map");
                     *deg -= 1;
                     if *deg == 0 {
-                        queue.push_back(dep.clone());
+                        queue.push_back(dep);
                     }
                 }
             }
         }
 
         if sorted.len() != databases.len() {
-            let in_cycle: Vec<String> = in_degree
+            let in_cycle: Vec<&str> = in_degree
                 .iter()
                 .filter(|(_, deg)| **deg > 0)
-                .map(|(name, _)| name.clone())
+                .map(|(&name, _)| name)
                 .collect();
             return Err(WaypointError::MultiDbDependencyCycle {
                 path: in_cycle.join(" -> "),
@@ -144,12 +149,13 @@ impl MultiWaypoint {
 
             let config = db.to_waypoint_config();
             let conn_string = config.connection_string()?;
-            let client = crate::db::connect_with_config(
+            let client = crate::db::connect_with_full_config(
                 &conn_string,
                 &config.database.ssl_mode,
                 config.database.connect_retries,
                 config.database.connect_timeout_secs,
                 config.database.statement_timeout_secs,
+                config.database.keepalive_secs,
             )
             .await?;
             clients.insert(db.name.clone(), client);

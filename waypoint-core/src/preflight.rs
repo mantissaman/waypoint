@@ -235,10 +235,7 @@ async fn check_database_size(client: &Client) -> PreflightCheck {
 
 async fn check_lock_contention(client: &Client) -> PreflightCheck {
     match client
-        .query_one(
-            "SELECT count(*)::int FROM pg_locks WHERE NOT granted",
-            &[],
-        )
+        .query_one("SELECT count(*)::int FROM pg_locks WHERE NOT granted", &[])
         .await
     {
         Ok(row) => {
