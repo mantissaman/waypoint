@@ -27,10 +27,8 @@ impl MigrationVersion {
         }
 
         // Support both "." and "_" as segment separators
-        let segments: std::result::Result<Vec<u64>, _> = raw
-            .split(|c| c == '.' || c == '_')
-            .map(|s| s.parse::<u64>())
-            .collect();
+        let segments: std::result::Result<Vec<u64>, _> =
+            raw.split(['.', '_']).map(|s| s.parse::<u64>()).collect();
 
         let segments = segments.map_err(|e| {
             WaypointError::MigrationParseError(format!(
@@ -177,7 +175,11 @@ pub fn scan_migrations(locations: &[std::path::PathBuf]) -> Result<Vec<ResolvedM
         let entries = std::fs::read_dir(location).map_err(|e| {
             WaypointError::IoError(std::io::Error::new(
                 e.kind(),
-                format!("Failed to read migration directory '{}': {}", location.display(), e),
+                format!(
+                    "Failed to read migration directory '{}': {}",
+                    location.display(),
+                    e
+                ),
             ))
         })?;
 
@@ -224,15 +226,11 @@ pub fn scan_migrations(locations: &[std::path::PathBuf]) -> Result<Vec<ResolvedM
     }
 
     // Sort: versioned by version, repeatable by description
-    migrations.sort_by(|a, b| {
-        match (&a.kind, &b.kind) {
-            (MigrationKind::Versioned(va), MigrationKind::Versioned(vb)) => va.cmp(vb),
-            (MigrationKind::Versioned(_), MigrationKind::Repeatable) => Ordering::Less,
-            (MigrationKind::Repeatable, MigrationKind::Versioned(_)) => Ordering::Greater,
-            (MigrationKind::Repeatable, MigrationKind::Repeatable) => {
-                a.description.cmp(&b.description)
-            }
-        }
+    migrations.sort_by(|a, b| match (&a.kind, &b.kind) {
+        (MigrationKind::Versioned(va), MigrationKind::Versioned(vb)) => va.cmp(vb),
+        (MigrationKind::Versioned(_), MigrationKind::Repeatable) => Ordering::Less,
+        (MigrationKind::Repeatable, MigrationKind::Versioned(_)) => Ordering::Greater,
+        (MigrationKind::Repeatable, MigrationKind::Repeatable) => a.description.cmp(&b.description),
     });
 
     Ok(migrations)
@@ -287,8 +285,7 @@ mod tests {
 
     #[test]
     fn test_parse_versioned_dotted_version() {
-        let (kind, desc) =
-            parse_migration_filename("V1.2.3__Add_column.sql").unwrap();
+        let (kind, desc) = parse_migration_filename("V1.2.3__Add_column.sql").unwrap();
         match kind {
             MigrationKind::Versioned(v) => assert_eq!(v.segments, vec![1, 2, 3]),
             _ => panic!("Expected Versioned"),
@@ -298,8 +295,7 @@ mod tests {
 
     #[test]
     fn test_parse_repeatable_filename() {
-        let (kind, desc) =
-            parse_migration_filename("R__Create_user_view.sql").unwrap();
+        let (kind, desc) = parse_migration_filename("R__Create_user_view.sql").unwrap();
         assert!(matches!(kind, MigrationKind::Repeatable));
         assert_eq!(desc, "Create user view");
     }

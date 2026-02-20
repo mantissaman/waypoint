@@ -32,9 +32,8 @@ pub fn validate_identifier(name: &str) -> Result<()> {
 
 /// Build a rustls ClientConfig using the Mozilla CA bundle.
 fn make_rustls_config() -> rustls::ClientConfig {
-    let root_store = rustls::RootCertStore::from_iter(
-        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-    );
+    let root_store =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth()
@@ -73,8 +72,7 @@ async fn connect_once(
             SslMode::Require => {
                 let tls_config = make_rustls_config();
                 let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
-                let (client, connection) =
-                    tokio_postgres::connect(conn_string, tls).await?;
+                let (client, connection) = tokio_postgres::connect(conn_string, tls).await?;
                 tokio::spawn(async move {
                     if let Err(e) = connection.await {
                         tracing::error!(error = %e, "Database connection error");
@@ -173,7 +171,8 @@ pub async fn connect_with_config(
 
                 // Set statement timeout if configured
                 if statement_timeout_secs > 0 {
-                    let timeout_sql = format!("SET statement_timeout = '{}s'", statement_timeout_secs);
+                    let timeout_sql =
+                        format!("SET statement_timeout = '{}s'", statement_timeout_secs);
                     client.batch_execute(&timeout_sql).await?;
                 }
 

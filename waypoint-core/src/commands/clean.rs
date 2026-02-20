@@ -8,7 +8,11 @@ use crate::error::{Result, WaypointError};
 ///
 /// Drop all tables, views, functions, sequences, types in managed schema(s).
 /// Requires clean_enabled=true or allow_clean=true.
-pub async fn execute(client: &Client, config: &WaypointConfig, allow_clean: bool) -> Result<Vec<String>> {
+pub async fn execute(
+    client: &Client,
+    config: &WaypointConfig,
+    allow_clean: bool,
+) -> Result<Vec<String>> {
     if !config.migrations.clean_enabled && !allow_clean {
         return Err(WaypointError::CleanDisabled);
     }
@@ -28,7 +32,11 @@ pub async fn execute(client: &Client, config: &WaypointConfig, allow_clean: bool
         .await?;
     for row in rows {
         let name: String = row.get(0);
-        let sql = format!("DROP MATERIALIZED VIEW IF EXISTS {}.{} CASCADE", schema_q, quote_ident(&name));
+        let sql = format!(
+            "DROP MATERIALIZED VIEW IF EXISTS {}.{} CASCADE",
+            schema_q,
+            quote_ident(&name)
+        );
         client.batch_execute(&sql).await?;
         dropped.push(format!("Materialized view: {}.{}", schema, name));
     }
@@ -42,7 +50,11 @@ pub async fn execute(client: &Client, config: &WaypointConfig, allow_clean: bool
         .await?;
     for row in rows {
         let name: String = row.get(0);
-        let sql = format!("DROP VIEW IF EXISTS {}.{} CASCADE", schema_q, quote_ident(&name));
+        let sql = format!(
+            "DROP VIEW IF EXISTS {}.{} CASCADE",
+            schema_q,
+            quote_ident(&name)
+        );
         client.batch_execute(&sql).await?;
         dropped.push(format!("View: {}.{}", schema, name));
     }
@@ -56,7 +68,11 @@ pub async fn execute(client: &Client, config: &WaypointConfig, allow_clean: bool
         .await?;
     for row in rows {
         let name: String = row.get(0);
-        let sql = format!("DROP TABLE IF EXISTS {}.{} CASCADE", schema_q, quote_ident(&name));
+        let sql = format!(
+            "DROP TABLE IF EXISTS {}.{} CASCADE",
+            schema_q,
+            quote_ident(&name)
+        );
         client.batch_execute(&sql).await?;
         dropped.push(format!("Table: {}.{}", schema, name));
     }
@@ -70,7 +86,11 @@ pub async fn execute(client: &Client, config: &WaypointConfig, allow_clean: bool
         .await?;
     for row in rows {
         let name: String = row.get(0);
-        let sql = format!("DROP SEQUENCE IF EXISTS {}.{} CASCADE", schema_q, quote_ident(&name));
+        let sql = format!(
+            "DROP SEQUENCE IF EXISTS {}.{} CASCADE",
+            schema_q,
+            quote_ident(&name)
+        );
         client.batch_execute(&sql).await?;
         dropped.push(format!("Sequence: {}.{}", schema, name));
     }
@@ -88,7 +108,12 @@ pub async fn execute(client: &Client, config: &WaypointConfig, allow_clean: bool
     for row in rows {
         let name: String = row.get(0);
         let args: String = row.get(1);
-        let sql = format!("DROP FUNCTION IF EXISTS {}.{}({}) CASCADE", schema_q, quote_ident(&name), args);
+        let sql = format!(
+            "DROP FUNCTION IF EXISTS {}.{}({}) CASCADE",
+            schema_q,
+            quote_ident(&name),
+            args
+        );
         client.batch_execute(&sql).await?;
         dropped.push(format!("Function: {}.{}", schema, name));
     }
@@ -107,7 +132,11 @@ pub async fn execute(client: &Client, config: &WaypointConfig, allow_clean: bool
         .await?;
     for row in rows {
         let name: String = row.get(0);
-        let sql = format!("DROP TYPE IF EXISTS {}.{} CASCADE", schema_q, quote_ident(&name));
+        let sql = format!(
+            "DROP TYPE IF EXISTS {}.{} CASCADE",
+            schema_q,
+            quote_ident(&name)
+        );
         client.batch_execute(&sql).await?;
         dropped.push(format!("Type: {}.{}", schema, name));
     }

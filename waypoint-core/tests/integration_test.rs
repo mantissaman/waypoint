@@ -17,8 +17,7 @@ use waypoint_core::history;
 use waypoint_core::Waypoint;
 
 fn get_test_url() -> String {
-    std::env::var("TEST_DATABASE_URL")
-        .expect("TEST_DATABASE_URL must be set for integration tests")
+    std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set for integration tests")
 }
 
 /// Build a config pointing at a unique schema to isolate test runs.
@@ -53,7 +52,10 @@ async fn setup_schema(prefix: &str) -> (tokio_postgres::Client, String) {
     let schema = format!("waypoint_test_{}_{}", prefix, id);
 
     client
-        .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {}", quote_ident(&schema)))
+        .batch_execute(&format!(
+            "CREATE SCHEMA IF NOT EXISTS {}",
+            quote_ident(&schema)
+        ))
         .await
         .expect("Failed to create test schema");
 
@@ -63,7 +65,10 @@ async fn setup_schema(prefix: &str) -> (tokio_postgres::Client, String) {
 /// Helper: drop the test schema.
 async fn teardown_schema(client: &tokio_postgres::Client, schema: &str) {
     let _ = client
-        .batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(schema)))
+        .batch_execute(&format!(
+            "DROP SCHEMA IF EXISTS {} CASCADE",
+            quote_ident(schema)
+        ))
         .await;
 }
 
@@ -110,7 +115,10 @@ async fn test_migrate_applies_versioned_migrations() {
     let migrations = create_temp_migrations(&[
         (
             "V1__Create_things.sql",
-            &format!("CREATE TABLE {}.things (id SERIAL PRIMARY KEY, name TEXT);", schema),
+            &format!(
+                "CREATE TABLE {}.things (id SERIAL PRIMARY KEY, name TEXT);",
+                schema
+            ),
         ),
         (
             "V2__Add_value.sql",
@@ -163,7 +171,10 @@ async fn test_migrate_applies_repeatable_and_reapplies_on_change() {
     .unwrap();
     std::fs::write(
         dir.join("R__Items_view.sql"),
-        format!("CREATE OR REPLACE VIEW {}.items_view AS SELECT id FROM {}.items;", schema, schema),
+        format!(
+            "CREATE OR REPLACE VIEW {}.items_view AS SELECT id FROM {}.items;",
+            schema, schema
+        ),
     )
     .unwrap();
 
@@ -176,7 +187,10 @@ async fn test_migrate_applies_repeatable_and_reapplies_on_change() {
     // Now modify the repeatable
     std::fs::write(
         dir.join("R__Items_view.sql"),
-        format!("CREATE OR REPLACE VIEW {}.items_view AS SELECT id FROM {}.items WHERE id > 0;", schema, schema),
+        format!(
+            "CREATE OR REPLACE VIEW {}.items_view AS SELECT id FROM {}.items WHERE id > 0;",
+            schema, schema
+        ),
     )
     .unwrap();
 
@@ -312,7 +326,10 @@ async fn test_repair_removes_failed_and_updates_checksums() {
     // Now modify V1 file to trigger checksum update
     std::fs::write(
         dir.join("V1__Good.sql"),
-        format!("CREATE TABLE {}.repair_test (id SERIAL PRIMARY KEY);", schema),
+        format!(
+            "CREATE TABLE {}.repair_test (id SERIAL PRIMARY KEY);",
+            schema
+        ),
     )
     .unwrap();
 
@@ -340,13 +357,9 @@ async fn test_baseline_inserts_baseline_row() {
 
     // Check that baseline row exists
     let client2 = db::connect(&get_test_url()).await.unwrap();
-    let applied = history::get_applied_migrations(
-        &client2,
-        &schema,
-        "waypoint_schema_history",
-    )
-    .await
-    .unwrap();
+    let applied = history::get_applied_migrations(&client2, &schema, "waypoint_schema_history")
+        .await
+        .unwrap();
 
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].version.as_deref(), Some("3"));
@@ -403,12 +416,10 @@ async fn test_baseline_prevents_old_migrations() {
 async fn test_clean_drops_everything() {
     let (client, schema) = setup_schema("clean").await;
 
-    let migrations = create_temp_migrations(&[
-        (
-            "V1__Create_clean_test.sql",
-            &format!("CREATE TABLE {}.clean_tbl (id SERIAL PRIMARY KEY);", schema),
-        ),
-    ]);
+    let migrations = create_temp_migrations(&[(
+        "V1__Create_clean_test.sql",
+        &format!("CREATE TABLE {}.clean_tbl (id SERIAL PRIMARY KEY);", schema),
+    )]);
 
     let config = test_config(&schema, migrations.path().to_str().unwrap());
     let wp = Waypoint::with_client(config.clone(), client);
@@ -528,7 +539,10 @@ async fn test_out_of_order_allowed_when_enabled() {
     config.migrations.out_of_order = true;
     let client2 = db::connect(&get_test_url()).await.unwrap();
     let wp2 = Waypoint::with_client(config, client2);
-    let report = wp2.migrate(None).await.expect("out-of-order migrate should succeed");
+    let report = wp2
+        .migrate(None)
+        .await
+        .expect("out-of-order migrate should succeed");
     assert_eq!(report.migrations_applied, 1);
     assert_eq!(report.details[0].version.as_deref(), Some("1"));
 

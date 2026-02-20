@@ -80,7 +80,10 @@ pub fn print_migrate_summary(report: &waypoint_core::MigrateReport) {
     }
 
     if report.migrations_applied == 0 {
-        println!("{}", "Schema is up to date. No migration necessary.".green());
+        println!(
+            "{}",
+            "Schema is up to date. No migration necessary.".green()
+        );
         return;
     }
 
@@ -109,7 +112,12 @@ pub fn print_migrate_summary(report: &waypoint_core::MigrateReport) {
 /// Print a validate report.
 pub fn print_validate_result(report: &waypoint_core::ValidateReport) {
     if report.valid {
-        println!("{}", "Successfully validated all applied migrations.".green().bold());
+        println!(
+            "{}",
+            "Successfully validated all applied migrations."
+                .green()
+                .bold()
+        );
     }
 
     for warning in &report.warnings {
@@ -141,7 +149,12 @@ pub fn print_clean_result(dropped: &[String]) {
         return;
     }
 
-    println!("{}", format!("Successfully cleaned. Dropped {} object(s):", dropped.len()).green().bold());
+    println!(
+        "{}",
+        format!("Successfully cleaned. Dropped {} object(s):", dropped.len())
+            .green()
+            .bold()
+    );
     for item in dropped {
         println!("  {} {}", "✗".red(), item);
     }

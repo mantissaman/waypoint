@@ -7,20 +7,15 @@ use serde::Deserialize;
 use crate::error::{Result, WaypointError};
 
 /// SSL/TLS connection mode.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SslMode {
     /// Never use TLS (current default behavior).
     Disable,
     /// Try TLS first, fall back to plaintext.
+    #[default]
     Prefer,
     /// Require TLS — fail if handshake fails.
     Require,
-}
-
-impl Default for SslMode {
-    fn default() -> Self {
-        SslMode::Prefer
-    }
 }
 
 impl std::str::FromStr for SslMode {
@@ -40,7 +35,7 @@ impl std::str::FromStr for SslMode {
 }
 
 /// Top-level configuration for Waypoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WaypointConfig {
     pub database: DatabaseConfig,
     pub migrations: MigrationSettings,
@@ -134,17 +129,6 @@ impl Default for MigrationSettings {
     }
 }
 
-impl Default for WaypointConfig {
-    fn default() -> Self {
-        Self {
-            database: DatabaseConfig::default(),
-            migrations: MigrationSettings::default(),
-            hooks: HooksConfig::default(),
-            placeholders: HashMap::new(),
-        }
-    }
-}
-
 // ── TOML deserialization structs ──
 
 #[derive(Deserialize, Default)]
@@ -233,7 +217,10 @@ impl WaypointConfig {
                 }
             }
             let toml_config: TomlConfig = toml::from_str(&content).map_err(|e| {
-                WaypointError::ConfigError(format!("Failed to parse config file '{}': {}", toml_path, e))
+                WaypointError::ConfigError(format!(
+                    "Failed to parse config file '{}': {}",
+                    toml_path, e
+                ))
             })?;
             config.apply_toml(toml_config);
         } else if config_path.is_some() {
@@ -265,33 +252,65 @@ impl WaypointConfig {
 
     fn apply_toml(&mut self, toml: TomlConfig) {
         if let Some(db) = toml.database {
-            if let Some(v) = db.url { self.database.url = Some(v); }
-            if let Some(v) = db.host { self.database.host = Some(v); }
-            if let Some(v) = db.port { self.database.port = Some(v); }
-            if let Some(v) = db.user { self.database.user = Some(v); }
-            if let Some(v) = db.password { self.database.password = Some(v); }
-            if let Some(v) = db.database { self.database.database = Some(v); }
-            if let Some(v) = db.connect_retries { self.database.connect_retries = v; }
+            if let Some(v) = db.url {
+                self.database.url = Some(v);
+            }
+            if let Some(v) = db.host {
+                self.database.host = Some(v);
+            }
+            if let Some(v) = db.port {
+                self.database.port = Some(v);
+            }
+            if let Some(v) = db.user {
+                self.database.user = Some(v);
+            }
+            if let Some(v) = db.password {
+                self.database.password = Some(v);
+            }
+            if let Some(v) = db.database {
+                self.database.database = Some(v);
+            }
+            if let Some(v) = db.connect_retries {
+                self.database.connect_retries = v;
+            }
             if let Some(v) = db.ssl_mode {
                 if let Ok(mode) = v.parse() {
                     self.database.ssl_mode = mode;
                 }
             }
-            if let Some(v) = db.connect_timeout { self.database.connect_timeout_secs = v; }
-            if let Some(v) = db.statement_timeout { self.database.statement_timeout_secs = v; }
+            if let Some(v) = db.connect_timeout {
+                self.database.connect_timeout_secs = v;
+            }
+            if let Some(v) = db.statement_timeout {
+                self.database.statement_timeout_secs = v;
+            }
         }
 
         if let Some(m) = toml.migrations {
             if let Some(v) = m.locations {
                 self.migrations.locations = v.into_iter().map(|s| normalize_location(&s)).collect();
             }
-            if let Some(v) = m.table { self.migrations.table = v; }
-            if let Some(v) = m.schema { self.migrations.schema = v; }
-            if let Some(v) = m.out_of_order { self.migrations.out_of_order = v; }
-            if let Some(v) = m.validate_on_migrate { self.migrations.validate_on_migrate = v; }
-            if let Some(v) = m.clean_enabled { self.migrations.clean_enabled = v; }
-            if let Some(v) = m.baseline_version { self.migrations.baseline_version = v; }
-            if let Some(v) = m.installed_by { self.migrations.installed_by = Some(v); }
+            if let Some(v) = m.table {
+                self.migrations.table = v;
+            }
+            if let Some(v) = m.schema {
+                self.migrations.schema = v;
+            }
+            if let Some(v) = m.out_of_order {
+                self.migrations.out_of_order = v;
+            }
+            if let Some(v) = m.validate_on_migrate {
+                self.migrations.validate_on_migrate = v;
+            }
+            if let Some(v) = m.clean_enabled {
+                self.migrations.clean_enabled = v;
+            }
+            if let Some(v) = m.baseline_version {
+                self.migrations.baseline_version = v;
+            }
+            if let Some(v) = m.installed_by {
+                self.migrations.installed_by = Some(v);
+            }
         }
 
         if let Some(h) = toml.hooks {
@@ -356,7 +375,8 @@ impl WaypointConfig {
             }
         }
         if let Ok(v) = std::env::var("WAYPOINT_MIGRATIONS_LOCATIONS") {
-            self.migrations.locations = v.split(',').map(|s| normalize_location(s.trim())).collect();
+            self.migrations.locations =
+                v.split(',').map(|s| normalize_location(s.trim())).collect();
         }
         if let Ok(v) = std::env::var("WAYPOINT_MIGRATIONS_TABLE") {
             self.migrations.table = v;
@@ -368,7 +388,8 @@ impl WaypointConfig {
         // Scan for placeholder env vars: WAYPOINT_PLACEHOLDER_{KEY}
         for (key, value) in std::env::vars() {
             if let Some(placeholder_key) = key.strip_prefix("WAYPOINT_PLACEHOLDER_") {
-                self.placeholders.insert(placeholder_key.to_lowercase(), value);
+                self.placeholders
+                    .insert(placeholder_key.to_lowercase(), value);
             }
         }
     }
@@ -423,14 +444,19 @@ impl WaypointConfig {
 
         let host = self.database.host.as_deref().unwrap_or("localhost");
         let port = self.database.port.unwrap_or(5432);
-        let user = self.database.user.as_deref().ok_or_else(|| {
-            WaypointError::ConfigError("Database user is required".to_string())
-        })?;
-        let database = self.database.database.as_deref().ok_or_else(|| {
-            WaypointError::ConfigError("Database name is required".to_string())
-        })?;
+        let user =
+            self.database.user.as_deref().ok_or_else(|| {
+                WaypointError::ConfigError("Database user is required".to_string())
+            })?;
+        let database =
+            self.database.database.as_deref().ok_or_else(|| {
+                WaypointError::ConfigError("Database name is required".to_string())
+            })?;
 
-        let mut url = format!("host={} port={} user={} dbname={}", host, port, user, database);
+        let mut url = format!(
+            "host={} port={} user={} dbname={}",
+            host, port, user, database
+        );
 
         if let Some(ref password) = self.database.password {
             url.push_str(&format!(" password={}", password));
@@ -468,7 +494,10 @@ fn normalize_jdbc_url(url: &str) -> String {
 
         // If we extracted user/password, rebuild the URL with credentials in the authority
         if user.is_some() || password.is_some() {
-            if let Some(rest) = base.strip_prefix("postgresql://").or_else(|| base.strip_prefix("postgres://")) {
+            if let Some(rest) = base
+                .strip_prefix("postgresql://")
+                .or_else(|| base.strip_prefix("postgres://"))
+            {
                 let scheme = if base.starts_with("postgresql://") {
                     "postgresql"
                 } else {
@@ -503,9 +532,7 @@ fn normalize_jdbc_url(url: &str) -> String {
 
 /// Strip `filesystem:` prefix from a location path (Flyway compatibility).
 pub fn normalize_location(location: &str) -> PathBuf {
-    let stripped = location
-        .strip_prefix("filesystem:")
-        .unwrap_or(location);
+    let stripped = location.strip_prefix("filesystem:").unwrap_or(location);
     PathBuf::from(stripped)
 }
 
@@ -522,7 +549,10 @@ mod tests {
         assert!(config.migrations.validate_on_migrate);
         assert!(!config.migrations.clean_enabled);
         assert_eq!(config.migrations.baseline_version, "1");
-        assert_eq!(config.migrations.locations, vec![PathBuf::from("db/migrations")]);
+        assert_eq!(
+            config.migrations.locations,
+            vec![PathBuf::from("db/migrations")]
+        );
     }
 
     #[test]
@@ -578,10 +608,16 @@ mod tests {
 
         config.apply_cli(&overrides);
 
-        assert_eq!(config.database.url.as_deref(), Some("postgres://override@localhost/db"));
+        assert_eq!(
+            config.database.url.as_deref(),
+            Some("postgres://override@localhost/db")
+        );
         assert_eq!(config.migrations.schema, "custom_schema");
         assert_eq!(config.migrations.table, "custom_table");
-        assert_eq!(config.migrations.locations, vec![PathBuf::from("custom/path")]);
+        assert_eq!(
+            config.migrations.locations,
+            vec![PathBuf::from("custom/path")]
+        );
         assert!(config.migrations.out_of_order);
         assert!(!config.migrations.validate_on_migrate);
         assert_eq!(config.migrations.baseline_version, "5");
@@ -608,7 +644,10 @@ app_name = "myapp"
         let mut config = WaypointConfig::default();
         config.apply_toml(toml_config);
 
-        assert_eq!(config.database.url.as_deref(), Some("postgres://user:pass@localhost/mydb"));
+        assert_eq!(
+            config.database.url.as_deref(),
+            Some("postgres://user:pass@localhost/mydb")
+        );
         assert_eq!(config.migrations.table, "my_history");
         assert_eq!(config.migrations.schema, "app");
         assert!(config.migrations.out_of_order);
@@ -641,10 +680,7 @@ app_name = "myapp"
     #[test]
     fn test_normalize_jdbc_url_strips_jdbc_prefix() {
         let url = "jdbc:postgresql://myhost:5432/mydb";
-        assert_eq!(
-            normalize_jdbc_url(url),
-            "postgresql://myhost:5432/mydb"
-        );
+        assert_eq!(normalize_jdbc_url(url), "postgresql://myhost:5432/mydb");
     }
 
     #[test]

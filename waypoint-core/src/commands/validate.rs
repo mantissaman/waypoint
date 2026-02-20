@@ -6,7 +6,7 @@ use tokio_postgres::Client;
 use crate::config::WaypointConfig;
 use crate::error::{Result, WaypointError};
 use crate::history;
-use crate::migration::{ResolvedMigration, scan_migrations};
+use crate::migration::{scan_migrations, ResolvedMigration};
 
 /// Report returned after a validate operation.
 #[derive(Debug, Serialize)]

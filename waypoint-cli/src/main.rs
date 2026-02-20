@@ -196,11 +196,9 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
         url: cli.url,
         schema: cli.schema,
         table: cli.table,
-        locations: cli.locations.map(|l| {
-            l.split(',')
-                .map(|s| normalize_location(s.trim()))
-                .collect()
-        }),
+        locations: cli
+            .locations
+            .map(|l| l.split(',').map(|s| normalize_location(s.trim())).collect()),
         out_of_order,
         validate_on_migrate,
         baseline_version: match &cli.command {
@@ -300,21 +298,15 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
             baseline_version,
             baseline_description,
         } => {
-            wp.baseline(
-                baseline_version.as_deref(),
-                baseline_description.as_deref(),
-            )
-            .await?;
+            wp.baseline(baseline_version.as_deref(), baseline_description.as_deref())
+                .await?;
             if json_output {
                 println!(
                     "{}",
                     serde_json::json!({"success": true, "message": "Successfully baselined schema."})
                 );
             } else {
-                println!(
-                    "{}",
-                    "Successfully baselined schema.".green().bold()
-                );
+                println!("{}", "Successfully baselined schema.".green().bold());
             }
         }
         Commands::Clean { allow_clean } => {

@@ -8,7 +8,7 @@ use crate::db;
 use crate::error::{Result, WaypointError};
 use crate::history;
 use crate::hooks::{self, HookType, ResolvedHook};
-use crate::migration::{MigrationVersion, ResolvedMigration, scan_migrations};
+use crate::migration::{scan_migrations, MigrationVersion, ResolvedMigration};
 use crate::placeholder::{build_placeholders, replace_placeholders};
 
 /// Report returned after a migrate operation.
@@ -100,8 +100,12 @@ async fn run_migrate(
     let applied = history::get_applied_migrations(client, schema, table).await?;
 
     // Get database user info for placeholders
-    let db_user = db::get_current_user(client).await.unwrap_or_else(|_| "unknown".to_string());
-    let db_name = db::get_current_database(client).await.unwrap_or_else(|_| "unknown".to_string());
+    let db_user = db::get_current_user(client)
+        .await
+        .unwrap_or_else(|_| "unknown".to_string());
+    let db_name = db::get_current_database(client)
+        .await
+        .unwrap_or_else(|_| "unknown".to_string());
     let installed_by = config
         .migrations
         .installed_by
@@ -109,9 +113,7 @@ async fn run_migrate(
         .unwrap_or(&db_user);
 
     // Parse target version if provided
-    let target = target_version
-        .map(MigrationVersion::parse)
-        .transpose()?;
+    let target = target_version.map(MigrationVersion::parse).transpose()?;
 
     // Find the baseline version if any
     let baseline_version = applied
@@ -159,15 +161,19 @@ async fn run_migrate(
         &db_name,
         "beforeMigrate",
     );
-    let (count, ms) = hooks::run_hooks(client, config, &all_hooks, &HookType::BeforeMigrate, &before_placeholders).await?;
+    let (count, ms) = hooks::run_hooks(
+        client,
+        config,
+        &all_hooks,
+        &HookType::BeforeMigrate,
+        &before_placeholders,
+    )
+    .await?;
     report.hooks_executed += count;
     report.hooks_time_ms += ms;
 
     // ── Apply versioned migrations ──
-    let versioned: Vec<&ResolvedMigration> = resolved
-        .iter()
-        .filter(|m| m.is_versioned())
-        .collect();
+    let versioned: Vec<&ResolvedMigration> = resolved.iter().filter(|m| m.is_versioned()).collect();
 
     for migration in &versioned {
         let version = migration.version().unwrap();
@@ -213,7 +219,14 @@ async fn run_migrate(
             &db_name,
             &migration.script,
         );
-        let (count, ms) = hooks::run_hooks(client, config, &all_hooks, &HookType::BeforeEachMigrate, &each_placeholders).await?;
+        let (count, ms) = hooks::run_hooks(
+            client,
+            config,
+            &all_hooks,
+            &HookType::BeforeEachMigrate,
+            &each_placeholders,
+        )
+        .await?;
         report.hooks_executed += count;
         report.hooks_time_ms += ms;
 
@@ -231,7 +244,14 @@ async fn run_migrate(
         .await?;
 
         // afterEachMigrate hooks
-        let (count, ms) = hooks::run_hooks(client, config, &all_hooks, &HookType::AfterEachMigrate, &each_placeholders).await?;
+        let (count, ms) = hooks::run_hooks(
+            client,
+            config,
+            &all_hooks,
+            &HookType::AfterEachMigrate,
+            &each_placeholders,
+        )
+        .await?;
         report.hooks_executed += count;
         report.hooks_time_ms += ms;
 
@@ -246,10 +266,8 @@ async fn run_migrate(
     }
 
     // ── Apply repeatable migrations ──
-    let repeatables: Vec<&ResolvedMigration> = resolved
-        .iter()
-        .filter(|m| !m.is_versioned())
-        .collect();
+    let repeatables: Vec<&ResolvedMigration> =
+        resolved.iter().filter(|m| !m.is_versioned()).collect();
 
     for migration in &repeatables {
         // Check if already applied with same checksum
@@ -269,7 +287,14 @@ async fn run_migrate(
             &db_name,
             &migration.script,
         );
-        let (count, ms) = hooks::run_hooks(client, config, &all_hooks, &HookType::BeforeEachMigrate, &each_placeholders).await?;
+        let (count, ms) = hooks::run_hooks(
+            client,
+            config,
+            &all_hooks,
+            &HookType::BeforeEachMigrate,
+            &each_placeholders,
+        )
+        .await?;
         report.hooks_executed += count;
         report.hooks_time_ms += ms;
 
@@ -286,7 +311,14 @@ async fn run_migrate(
         .await?;
 
         // afterEachMigrate hooks
-        let (count, ms) = hooks::run_hooks(client, config, &all_hooks, &HookType::AfterEachMigrate, &each_placeholders).await?;
+        let (count, ms) = hooks::run_hooks(
+            client,
+            config,
+            &all_hooks,
+            &HookType::AfterEachMigrate,
+            &each_placeholders,
+        )
+        .await?;
         report.hooks_executed += count;
         report.hooks_time_ms += ms;
 
@@ -308,13 +340,21 @@ async fn run_migrate(
         &db_name,
         "afterMigrate",
     );
-    let (count, ms) = hooks::run_hooks(client, config, &all_hooks, &HookType::AfterMigrate, &after_placeholders).await?;
+    let (count, ms) = hooks::run_hooks(
+        client,
+        config,
+        &all_hooks,
+        &HookType::AfterMigrate,
+        &after_placeholders,
+    )
+    .await?;
     report.hooks_executed += count;
     report.hooks_time_ms += ms;
 
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_migration(
     client: &Client,
     config: &WaypointConfig,

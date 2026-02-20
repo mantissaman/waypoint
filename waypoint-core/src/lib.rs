@@ -70,11 +70,7 @@ impl Waypoint {
     }
 
     /// Baseline an existing database.
-    pub async fn baseline(
-        &self,
-        version: Option<&str>,
-        description: Option<&str>,
-    ) -> Result<()> {
+    pub async fn baseline(&self, version: Option<&str>, description: Option<&str>) -> Result<()> {
         commands::baseline::execute(&self.client, &self.config, version, description).await
     }
 

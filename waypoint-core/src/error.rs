@@ -54,7 +54,9 @@ pub enum WaypointError {
     #[error("Failed to acquire advisory lock: {0}")]
     LockError(String),
 
-    #[error("Clean is disabled. Pass --allow-clean to enable it or set clean_enabled = true in config.")]
+    #[error(
+        "Clean is disabled. Pass --allow-clean to enable it or set clean_enabled = true in config."
+    )]
     CleanDisabled,
 
     #[error("Baseline already exists. The schema history table is not empty.")]

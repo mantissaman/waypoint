@@ -38,7 +38,8 @@ pub struct ResolvedHook {
 }
 
 /// File prefixes that indicate hook callback files (Flyway-compatible).
-const HOOK_PREFIXES: &[(&str, fn() -> HookType)] = &[
+type HookPrefixEntry = (&'static str, fn() -> HookType);
+const HOOK_PREFIXES: &[HookPrefixEntry] = &[
     ("beforeEachMigrate", || HookType::BeforeEachMigrate),
     ("afterEachMigrate", || HookType::AfterEachMigrate),
     ("beforeMigrate", || HookType::BeforeMigrate),
@@ -47,7 +48,9 @@ const HOOK_PREFIXES: &[(&str, fn() -> HookType)] = &[
 
 /// Check if a filename is a hook callback file (not a migration).
 pub fn is_hook_file(filename: &str) -> bool {
-    HOOK_PREFIXES.iter().any(|(prefix, _)| filename.starts_with(prefix) && filename.ends_with(".sql"))
+    HOOK_PREFIXES
+        .iter()
+        .any(|(prefix, _)| filename.starts_with(prefix) && filename.ends_with(".sql"))
 }
 
 /// Scan migration locations for SQL callback hook files.
@@ -70,7 +73,11 @@ pub fn scan_hooks(locations: &[PathBuf]) -> Result<Vec<ResolvedHook>> {
         let entries = std::fs::read_dir(location).map_err(|e| {
             WaypointError::IoError(std::io::Error::new(
                 e.kind(),
-                format!("Failed to read hook directory '{}': {}", location.display(), e),
+                format!(
+                    "Failed to read hook directory '{}': {}",
+                    location.display(),
+                    e
+                ),
             ))
         })?;
 
@@ -139,11 +146,7 @@ pub fn load_config_hooks(config: &HooksConfig) -> Result<Vec<ResolvedHook>> {
             let sql = std::fs::read_to_string(path).map_err(|e| {
                 WaypointError::IoError(std::io::Error::new(
                     e.kind(),
-                    format!(
-                        "Failed to read hook file '{}': {}",
-                        path.display(),
-                        e
-                    ),
+                    format!("Failed to read hook file '{}': {}", path.display(), e),
                 ))
             })?;
 
@@ -243,8 +246,14 @@ mod tests {
 
         assert_eq!(hooks.len(), 2);
 
-        let before: Vec<_> = hooks.iter().filter(|h| h.hook_type == HookType::BeforeMigrate).collect();
-        let after: Vec<_> = hooks.iter().filter(|h| h.hook_type == HookType::AfterMigrate).collect();
+        let before: Vec<_> = hooks
+            .iter()
+            .filter(|h| h.hook_type == HookType::BeforeMigrate)
+            .collect();
+        let after: Vec<_> = hooks
+            .iter()
+            .filter(|h| h.hook_type == HookType::AfterMigrate)
+            .collect();
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].script_name, "beforeMigrate.sql");
         assert_eq!(after.len(), 1);

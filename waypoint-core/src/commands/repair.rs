@@ -6,7 +6,7 @@ use tokio_postgres::Client;
 use crate::config::WaypointConfig;
 use crate::error::Result;
 use crate::history;
-use crate::migration::{ResolvedMigration, scan_migrations};
+use crate::migration::{scan_migrations, ResolvedMigration};
 
 /// Report returned after a repair operation.
 #[derive(Debug, Serialize)]
@@ -62,14 +62,8 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<RepairR
         if let Some(ref version) = am.version {
             if let Some(resolved) = resolved_by_version.get(version) {
                 if am.checksum != Some(resolved.checksum) {
-                    history::update_checksum(
-                        client,
-                        schema,
-                        table,
-                        version,
-                        resolved.checksum,
-                    )
-                    .await?;
+                    history::update_checksum(client, schema, table, version, resolved.checksum)
+                        .await?;
                     details.push(format!(
                         "Updated checksum for version {} ({} -> {})",
                         version,
@@ -79,25 +73,23 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<RepairR
                     checksums_updated += 1;
                 }
             }
-        } else {
-            if let Some(resolved) = resolved_by_script.get(&am.script) {
-                if am.checksum != Some(resolved.checksum) {
-                    history::update_repeatable_checksum(
-                        client,
-                        schema,
-                        table,
-                        &am.script,
-                        resolved.checksum,
-                    )
-                    .await?;
-                    details.push(format!(
-                        "Updated checksum for repeatable '{}' ({} -> {})",
-                        am.script,
-                        am.checksum.unwrap_or(0),
-                        resolved.checksum
-                    ));
-                    checksums_updated += 1;
-                }
+        } else if let Some(resolved) = resolved_by_script.get(&am.script) {
+            if am.checksum != Some(resolved.checksum) {
+                history::update_repeatable_checksum(
+                    client,
+                    schema,
+                    table,
+                    &am.script,
+                    resolved.checksum,
+                )
+                .await?;
+                details.push(format!(
+                    "Updated checksum for repeatable '{}' ({} -> {})",
+                    am.script,
+                    am.checksum.unwrap_or(0),
+                    resolved.checksum
+                ));
+                checksums_updated += 1;
             }
         }
     }

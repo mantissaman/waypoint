@@ -116,6 +116,7 @@ pub async fn get_applied_migrations(
 ///
 /// Uses a subquery to atomically compute the next installed_rank within the INSERT,
 /// eliminating the race between reading the max rank and inserting.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_applied_migration(
     client: &Client,
     schema: &str,

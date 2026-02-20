@@ -16,8 +16,5 @@ fn main() {
 
     // Build timestamp
     let now = chrono::Utc::now();
-    println!(
-        "cargo:rustc-env=BUILD_TIME={}",
-        now.format("%Y-%m-%d")
-    );
+    println!("cargo:rustc-env=BUILD_TIME={}", now.format("%Y-%m-%d"));
 }

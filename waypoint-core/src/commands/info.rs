@@ -7,7 +7,7 @@ use tokio_postgres::Client;
 use crate::config::WaypointConfig;
 use crate::error::Result;
 use crate::history;
-use crate::migration::{MigrationKind, MigrationVersion, ResolvedMigration, scan_migrations};
+use crate::migration::{scan_migrations, MigrationKind, MigrationVersion, ResolvedMigration};
 
 /// The state of a migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -233,20 +233,18 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
     }
 
     // Sort: versioned by version, then repeatable by description
-    infos.sort_by(|a, b| {
-        match (&a.version, &b.version) {
-            (Some(av), Some(bv)) => {
-                let pa = MigrationVersion::parse(av);
-                let pb = MigrationVersion::parse(bv);
-                match (pa, pb) {
-                    (Ok(pa), Ok(pb)) => pa.cmp(&pb),
-                    _ => av.cmp(bv),
-                }
+    infos.sort_by(|a, b| match (&a.version, &b.version) {
+        (Some(av), Some(bv)) => {
+            let pa = MigrationVersion::parse(av);
+            let pb = MigrationVersion::parse(bv);
+            match (pa, pb) {
+                (Ok(pa), Ok(pb)) => pa.cmp(&pb),
+                _ => av.cmp(bv),
             }
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.description.cmp(&b.description),
         }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.description.cmp(&b.description),
     });
 
     Ok(infos)
