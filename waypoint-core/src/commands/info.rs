@@ -14,15 +14,26 @@ use crate::migration::{scan_migrations, MigrationKind, MigrationVersion, Resolve
 /// The state of a migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum MigrationState {
+    /// Migration file exists on disk but has not been applied yet.
     Pending,
+    /// Migration has been successfully applied to the database.
     Applied,
+    /// Migration execution failed (recorded in history as unsuccessful).
     Failed,
+    /// Migration is recorded in history but its file is missing from disk.
     Missing,
+    /// Repeatable migration whose checksum has changed since last application.
     Outdated,
+    /// Versioned migration with a version lower than the highest applied version.
     OutOfOrder,
+    /// Versioned migration with a version at or below the baseline.
     BelowBaseline,
+    /// Migration was skipped (e.g. filtered by environment).
     Ignored,
+    /// A baseline marker entry in the history table.
     Baseline,
+    /// Migration was applied but subsequently reverted by an undo operation.
+    Undone,
 }
 
 impl std::fmt::Display for MigrationState {
@@ -37,6 +48,7 @@ impl std::fmt::Display for MigrationState {
             MigrationState::BelowBaseline => write!(f, "Below Baseline"),
             MigrationState::Ignored => write!(f, "Ignored"),
             MigrationState::Baseline => write!(f, "Baseline"),
+            MigrationState::Undone => write!(f, "Undone"),
         }
     }
 }
@@ -44,13 +56,21 @@ impl std::fmt::Display for MigrationState {
 /// Combined view of a migration (file + history).
 #[derive(Debug, Clone, Serialize)]
 pub struct MigrationInfo {
+    /// Version string, or None for repeatable migrations.
     pub version: Option<String>,
+    /// Human-readable description from the migration filename.
     pub description: String,
+    /// Type of migration (e.g. "SQL", "BASELINE", "UNDO_SQL").
     pub migration_type: String,
+    /// Filename of the migration script.
     pub script: String,
+    /// Current state of this migration.
     pub state: MigrationState,
+    /// Timestamp when the migration was applied, if recorded in history.
     pub installed_on: Option<DateTime<Utc>>,
+    /// Execution time in milliseconds, if recorded in history.
     pub execution_time: Option<i32>,
+    /// CRC32 checksum of the migration SQL content.
     pub checksum: Option<i32>,
 }
 
@@ -61,10 +81,11 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
 
     // Ensure history table exists
     if !history::history_table_exists(client, schema, table).await? {
-        // No history table — all resolved migrations are Pending
+        // No history table — all resolved migrations are Pending (skip undo files)
         let resolved = scan_migrations(&config.migrations.locations)?;
         return Ok(resolved
             .into_iter()
+            .filter(|m| !m.is_undo())
             .map(|m| {
                 let version = m.version().map(|v| v.raw.clone());
                 let migration_type = m.migration_type().to_string();
@@ -85,7 +106,10 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
     let resolved = scan_migrations(&config.migrations.locations)?;
     let applied = history::get_applied_migrations(client, schema, table).await?;
 
-    // Build lookup maps
+    // Compute effective applied versions (respects undo state)
+    let effective = history::effective_applied_versions(&applied);
+
+    // Build lookup maps (exclude undo files — they aren't shown as separate info rows)
     let resolved_by_version: HashMap<String, &ResolvedMigration> = resolved
         .iter()
         .filter(|m| m.is_versioned())
@@ -94,7 +118,7 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
 
     let resolved_by_script: HashMap<String, &ResolvedMigration> = resolved
         .iter()
-        .filter(|m| !m.is_versioned())
+        .filter(|m| !m.is_versioned() && !m.is_undo())
         .map(|m| (m.script.clone(), m))
         .collect();
 
@@ -106,11 +130,9 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
         .map(|v| MigrationVersion::parse(v))
         .transpose()?;
 
-    // Highest applied version (use version presence, not type string, for Flyway compat)
-    let highest_applied = applied
+    // Highest effectively-applied version
+    let highest_applied = effective
         .iter()
-        .filter(|a| a.success && a.version.is_some())
-        .filter_map(|a| a.version.as_ref())
         .filter_map(|v| MigrationVersion::parse(v).ok())
         .max();
 
@@ -128,11 +150,16 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
 
         let state = if am.migration_type == "BASELINE" {
             MigrationState::Baseline
+        } else if am.migration_type == "UNDO_SQL" {
+            MigrationState::Undone
         } else if !am.success {
             MigrationState::Failed
         } else if is_versioned {
             if let Some(ref version) = am.version {
-                if resolved_by_version.contains_key(version) {
+                if !effective.contains(version) {
+                    // This forward migration was later undone
+                    MigrationState::Undone
+                } else if resolved_by_version.contains_key(version) {
                     MigrationState::Applied
                 } else {
                     MigrationState::Missing
@@ -174,8 +201,11 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
         });
     }
 
-    // Add pending resolved migrations not in history
+    // Add pending resolved migrations not in history (skip undo files)
     for m in &resolved {
+        if m.is_undo() {
+            continue;
+        }
         match &m.kind {
             MigrationKind::Versioned(version) => {
                 if seen_versions.contains_key(&version.raw) {
@@ -231,6 +261,7 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
                     checksum: Some(m.checksum),
                 });
             }
+            MigrationKind::Undo(_) => unreachable!("undo files are skipped above"),
         }
     }
 

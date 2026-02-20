@@ -14,9 +14,13 @@ use crate::placeholder::replace_placeholders;
 /// The phase at which a hook runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookType {
+    /// Runs once before the entire migration run begins.
     BeforeMigrate,
+    /// Runs once after the entire migration run completes.
     AfterMigrate,
+    /// Runs before each individual migration is applied.
     BeforeEachMigrate,
+    /// Runs after each individual migration is applied.
     AfterEachMigrate,
 }
 
@@ -34,8 +38,11 @@ impl fmt::Display for HookType {
 /// A hook SQL script discovered on disk or specified in config.
 #[derive(Debug, Clone)]
 pub struct ResolvedHook {
+    /// The phase at which this hook should be executed.
     pub hook_type: HookType,
+    /// Filename of the hook SQL script.
     pub script_name: String,
+    /// Raw SQL content of the hook file.
     pub sql: String,
 }
 
@@ -183,7 +190,7 @@ pub async fn run_hooks(
     let mut count = 0;
 
     for hook in hooks.iter().filter(|h| &h.hook_type == phase) {
-        tracing::info!("Running {} hook: {}", phase, hook.script_name);
+        log::info!("Running {} hook: {}", phase, hook.script_name);
 
         let sql = replace_placeholders(&hook.sql, placeholders)?;
 

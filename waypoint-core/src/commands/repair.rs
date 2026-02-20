@@ -13,8 +13,11 @@ use crate::migration::{scan_migrations, ResolvedMigration};
 /// Report returned after a repair operation.
 #[derive(Debug, Serialize)]
 pub struct RepairReport {
+    /// Number of failed migration entries removed from history.
     pub failed_removed: u64,
+    /// Number of checksum values updated to match current files.
     pub checksums_updated: usize,
+    /// Human-readable descriptions of each repair action taken.
     pub details: Vec<String>,
 }
 
@@ -96,11 +99,7 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<RepairR
         }
     }
 
-    tracing::info!(
-        failed_removed = failed_removed,
-        checksums_updated = checksums_updated,
-        "Repair completed"
-    );
+    log::info!("Repair completed; failed_removed={}, checksums_updated={}", failed_removed, checksums_updated);
 
     Ok(RepairReport {
         failed_removed,

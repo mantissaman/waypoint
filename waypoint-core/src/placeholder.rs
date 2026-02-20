@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use regex::Regex;
+use regex_lite::Regex;
 
 use crate::error::{Result, WaypointError};
 

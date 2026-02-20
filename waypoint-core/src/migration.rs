@@ -6,19 +6,23 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::sync::LazyLock;
 
-use regex::Regex;
+use regex_lite::Regex;
 
 use crate::checksum::calculate_checksum;
+use crate::directive::{self, MigrationDirectives};
 use crate::error::{Result, WaypointError};
 use crate::hooks;
 
 static VERSIONED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^V([\d._]+)__(.+)$").unwrap());
+static UNDO_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^U([\d._]+)__(.+)$").unwrap());
 static REPEATABLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^R__(.+)$").unwrap());
 
 /// A parsed migration version, supporting dotted numeric segments (e.g., "1.2.3").
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MigrationVersion {
+    /// Parsed numeric segments of the version (e.g., `[1, 2, 3]` for `"1.2.3"`).
     pub segments: Vec<u64>,
+    /// Original version string as it appeared in the filename.
     pub raw: String,
 }
 
@@ -83,6 +87,8 @@ pub enum MigrationType {
     Versioned,
     /// R__{description}.sql
     Repeatable,
+    /// U{version}__{description}.sql
+    Undo,
 }
 
 impl fmt::Display for MigrationType {
@@ -90,6 +96,7 @@ impl fmt::Display for MigrationType {
         match self {
             MigrationType::Versioned => write!(f, "SQL"),
             MigrationType::Repeatable => write!(f, "SQL_REPEATABLE"),
+            MigrationType::Undo => write!(f, "UNDO_SQL"),
         }
     }
 }
@@ -100,25 +107,36 @@ impl fmt::Display for MigrationType {
 /// This eliminates the `Option<MigrationVersion>` + `MigrationType` redundancy.
 #[derive(Debug, Clone)]
 pub enum MigrationKind {
+    /// A versioned migration with an associated version number.
     Versioned(MigrationVersion),
+    /// A repeatable migration that is re-applied whenever its checksum changes.
     Repeatable,
+    /// An undo migration that reverses a specific versioned migration.
+    Undo(MigrationVersion),
 }
 
 /// A migration file discovered on disk.
 #[derive(Debug, Clone)]
 pub struct ResolvedMigration {
+    /// Whether this is a versioned, repeatable, or undo migration (with version if applicable).
     pub kind: MigrationKind,
+    /// Human-readable description extracted from the filename.
     pub description: String,
+    /// Original filename of the migration script (e.g., `V1__Create_users.sql`).
     pub script: String,
+    /// CRC32 checksum of the migration SQL content.
     pub checksum: i32,
+    /// Raw SQL content of the migration file.
     pub sql: String,
+    /// Parsed directives from SQL comments (e.g., `@depends`, `@environment`).
+    pub directives: MigrationDirectives,
 }
 
 impl ResolvedMigration {
-    /// Get the version if this is a versioned migration.
+    /// Get the version if this is a versioned or undo migration.
     pub fn version(&self) -> Option<&MigrationVersion> {
         match &self.kind {
-            MigrationKind::Versioned(v) => Some(v),
+            MigrationKind::Versioned(v) | MigrationKind::Undo(v) => Some(v),
             MigrationKind::Repeatable => None,
         }
     }
@@ -128,12 +146,18 @@ impl ResolvedMigration {
         match &self.kind {
             MigrationKind::Versioned(_) => MigrationType::Versioned,
             MigrationKind::Repeatable => MigrationType::Repeatable,
+            MigrationKind::Undo(_) => MigrationType::Undo,
         }
     }
 
     /// Whether this is a versioned migration.
     pub fn is_versioned(&self) -> bool {
         matches!(&self.kind, MigrationKind::Versioned(_))
+    }
+
+    /// Whether this is an undo migration.
+    pub fn is_undo(&self) -> bool {
+        matches!(&self.kind, MigrationKind::Undo(_))
     }
 }
 
@@ -156,12 +180,17 @@ pub fn parse_migration_filename(filename: &str) -> Result<(MigrationKind, String
         let description = caps.get(2).unwrap().as_str().replace('_', " ");
         let version = MigrationVersion::parse(version_str)?;
         Ok((MigrationKind::Versioned(version), description))
+    } else if let Some(caps) = UNDO_RE.captures(stem) {
+        let version_str = caps.get(1).unwrap().as_str();
+        let description = caps.get(2).unwrap().as_str().replace('_', " ");
+        let version = MigrationVersion::parse(version_str)?;
+        Ok((MigrationKind::Undo(version), description))
     } else if let Some(caps) = REPEATABLE_RE.captures(stem) {
         let description = caps.get(1).unwrap().as_str().replace('_', " ");
         Ok((MigrationKind::Repeatable, description))
     } else {
         Err(WaypointError::MigrationParseError(format!(
-            "Migration file '{}' does not match V{{version}}__{{description}}.sql or R__{{description}}.sql pattern",
+            "Migration file '{}' does not match V{{version}}__{{description}}.sql, U{{version}}__{{description}}.sql, or R__{{description}}.sql pattern",
             filename
         )))
     }
@@ -173,7 +202,7 @@ pub fn scan_migrations(locations: &[std::path::PathBuf]) -> Result<Vec<ResolvedM
 
     for location in locations {
         if !location.exists() {
-            tracing::warn!("Migration location does not exist: {}", location.display());
+            log::warn!("Migration location does not exist: {}", location.display());
             continue;
         }
 
@@ -211,14 +240,15 @@ pub fn scan_migrations(locations: &[std::path::PathBuf]) -> Result<Vec<ResolvedM
                 continue;
             }
 
-            // Skip files that don't start with V or R
-            if !filename.starts_with('V') && !filename.starts_with('R') {
+            // Skip files that don't start with V, U, or R
+            if !filename.starts_with('V') && !filename.starts_with('U') && !filename.starts_with('R') {
                 continue;
             }
 
             let (kind, description) = parse_migration_filename(&filename)?;
             let sql = std::fs::read_to_string(&path)?;
             let checksum = calculate_checksum(&sql);
+            let directives = directive::parse_directives(&sql);
 
             migrations.push(ResolvedMigration {
                 kind,
@@ -226,16 +256,34 @@ pub fn scan_migrations(locations: &[std::path::PathBuf]) -> Result<Vec<ResolvedM
                 script: filename,
                 checksum,
                 sql,
+                directives,
             });
         }
     }
 
-    // Sort: versioned by version, repeatable by description
-    migrations.sort_by(|a, b| match (&a.kind, &b.kind) {
-        (MigrationKind::Versioned(va), MigrationKind::Versioned(vb)) => va.cmp(vb),
-        (MigrationKind::Versioned(_), MigrationKind::Repeatable) => Ordering::Less,
-        (MigrationKind::Repeatable, MigrationKind::Versioned(_)) => Ordering::Greater,
-        (MigrationKind::Repeatable, MigrationKind::Repeatable) => a.description.cmp(&b.description),
+    // Sort: versioned by version, then undo by version, then repeatable by description
+    migrations.sort_by(|a, b| {
+        // Order groups: Versioned first, then Undo, then Repeatable
+        fn group_order(kind: &MigrationKind) -> u8 {
+            match kind {
+                MigrationKind::Versioned(_) => 0,
+                MigrationKind::Undo(_) => 1,
+                MigrationKind::Repeatable => 2,
+            }
+        }
+        let ga = group_order(&a.kind);
+        let gb = group_order(&b.kind);
+        if ga != gb {
+            return ga.cmp(&gb);
+        }
+        match (&a.kind, &b.kind) {
+            (MigrationKind::Versioned(va), MigrationKind::Versioned(vb)) => va.cmp(vb),
+            (MigrationKind::Undo(va), MigrationKind::Undo(vb)) => va.cmp(vb),
+            (MigrationKind::Repeatable, MigrationKind::Repeatable) => {
+                a.description.cmp(&b.description)
+            }
+            _ => Ordering::Equal,
+        }
     });
 
     Ok(migrations)
@@ -310,5 +358,41 @@ mod tests {
         assert!(parse_migration_filename("random.sql").is_err());
         assert!(parse_migration_filename("V1_missing_separator.sql").is_err());
         assert!(parse_migration_filename("V1__no_ext").is_err());
+    }
+
+    #[test]
+    fn test_parse_undo_filename() {
+        let (kind, desc) = parse_migration_filename("U1__Create_users.sql").unwrap();
+        match kind {
+            MigrationKind::Undo(v) => assert_eq!(v.segments, vec![1]),
+            _ => panic!("Expected Undo"),
+        }
+        assert_eq!(desc, "Create users");
+    }
+
+    #[test]
+    fn test_parse_undo_dotted_version() {
+        let (kind, desc) = parse_migration_filename("U1.2.3__Add_column.sql").unwrap();
+        match kind {
+            MigrationKind::Undo(v) => assert_eq!(v.segments, vec![1, 2, 3]),
+            _ => panic!("Expected Undo"),
+        }
+        assert_eq!(desc, "Add column");
+    }
+
+    #[test]
+    fn test_undo_is_undo() {
+        let m = ResolvedMigration {
+            kind: MigrationKind::Undo(MigrationVersion::parse("1").unwrap()),
+            description: "test".to_string(),
+            script: "U1__test.sql".to_string(),
+            checksum: 0,
+            sql: String::new(),
+            directives: MigrationDirectives::default(),
+        };
+        assert!(m.is_undo());
+        assert!(!m.is_versioned());
+        assert_eq!(m.migration_type(), MigrationType::Undo);
+        assert_eq!(m.migration_type().to_string(), "UNDO_SQL");
     }
 }

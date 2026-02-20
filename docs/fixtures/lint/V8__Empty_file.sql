@@ -1,0 +1,2 @@
+-- This file intentionally has no SQL statements
+-- It only contains comments

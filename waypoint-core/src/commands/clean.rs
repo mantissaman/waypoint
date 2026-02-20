@@ -23,7 +23,7 @@ pub async fn execute(
     let schema_q = quote_ident(schema);
     let mut dropped = Vec::new();
 
-    tracing::warn!(schema = %schema, "Starting clean — this will DROP all objects in the schema");
+    log::warn!("Starting clean — this will DROP all objects in the schema; schema={}", schema);
 
     // Drop materialized views
     let rows = client
@@ -143,7 +143,7 @@ pub async fn execute(
         dropped.push(format!("Type: {}.{}", schema, name));
     }
 
-    tracing::warn!(schema = %schema, objects_dropped = dropped.len(), "Clean completed");
+    log::warn!("Clean completed; schema={}, objects_dropped={}", schema, dropped.len());
 
     Ok(dropped)
 }

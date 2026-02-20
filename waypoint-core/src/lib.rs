@@ -21,31 +21,55 @@
 //! - [`migration`] — Migration file parsing and scanning
 //! - [`db`] — Database connections, TLS, advisory locks
 //! - [`history`] — Schema history table operations
-//! - [`commands`] — Individual command implementations (migrate, info, validate, repair, baseline, clean)
+//! - [`commands`] — Individual command implementations
 //! - [`checksum`] — CRC32 checksums (Flyway-compatible)
 //! - [`placeholder`] — `${key}` placeholder replacement in SQL
 //! - [`hooks`] — SQL callback hooks (before/after migrate)
+//! - [`directive`] — `-- waypoint:*` comment directive parsing
+//! - [`sql_parser`] — Regex-based DDL extraction
+//! - [`schema`] — PostgreSQL schema introspection + diff
+//! - [`dependency`] — Migration dependency graph
+//! - [`preflight`] — Pre-migration health checks
+//! - [`multi`] — Multi-database orchestration
 //! - [`error`] — Error types
 
 pub mod checksum;
 pub mod commands;
 pub mod config;
 pub mod db;
+pub mod dependency;
+pub mod directive;
 pub mod error;
 pub mod history;
 pub mod hooks;
 pub mod migration;
+pub mod multi;
 pub mod placeholder;
+pub mod preflight;
+pub mod schema;
+pub mod sql_parser;
+
+use std::path::PathBuf;
 
 use config::WaypointConfig;
 use error::Result;
 use tokio_postgres::Client;
 
+pub use commands::changelog::ChangelogReport;
+pub use commands::check_conflicts::ConflictReport;
+pub use commands::diff::DiffReport;
+pub use commands::drift::DriftReport;
+pub use commands::explain::ExplainReport;
 pub use commands::info::{MigrationInfo, MigrationState};
+pub use commands::lint::LintReport;
 pub use commands::migrate::MigrateReport;
 pub use commands::repair::RepairReport;
+pub use commands::snapshot::{RestoreReport, SnapshotReport};
+pub use commands::undo::{UndoReport, UndoTarget};
 pub use commands::validate::ValidateReport;
 pub use config::CliOverrides;
+pub use multi::MultiWaypoint;
+pub use preflight::PreflightReport;
 
 /// Main entry point for the Waypoint library.
 ///
@@ -78,6 +102,11 @@ impl Waypoint {
         Self { config, client }
     }
 
+    /// Get a reference to the underlying database client.
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
     /// Apply pending migrations.
     pub async fn migrate(&self, target_version: Option<&str>) -> Result<MigrateReport> {
         commands::migrate::execute(&self.client, &self.config, target_version).await
@@ -103,8 +132,76 @@ impl Waypoint {
         commands::baseline::execute(&self.client, &self.config, version, description).await
     }
 
+    /// Undo applied migrations.
+    pub async fn undo(&self, target: UndoTarget) -> Result<UndoReport> {
+        commands::undo::execute(&self.client, &self.config, target).await
+    }
+
     /// Drop all objects in managed schemas.
     pub async fn clean(&self, allow_clean: bool) -> Result<Vec<String>> {
         commands::clean::execute(&self.client, &self.config, allow_clean).await
+    }
+
+    /// Run lint on migration files (no DB required).
+    pub fn lint(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintReport> {
+        commands::lint::execute(locations, disabled_rules)
+    }
+
+    /// Generate changelog from migration files (no DB required).
+    pub fn changelog(
+        locations: &[PathBuf],
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<ChangelogReport> {
+        commands::changelog::execute(locations, from, to)
+    }
+
+    /// Compare database schema against a target.
+    pub async fn diff(
+        &self,
+        target: commands::diff::DiffTarget,
+    ) -> Result<DiffReport> {
+        commands::diff::execute(&self.client, &self.config, target).await
+    }
+
+    /// Detect schema drift.
+    pub async fn drift(&self) -> Result<DriftReport> {
+        commands::drift::execute(&self.client, &self.config).await
+    }
+
+    /// Take a schema snapshot.
+    pub async fn snapshot(
+        &self,
+        snapshot_config: &commands::snapshot::SnapshotConfig,
+    ) -> Result<SnapshotReport> {
+        commands::snapshot::execute_snapshot(&self.client, &self.config, snapshot_config).await
+    }
+
+    /// Restore from a schema snapshot.
+    pub async fn restore(
+        &self,
+        snapshot_config: &commands::snapshot::SnapshotConfig,
+        snapshot_id: &str,
+    ) -> Result<RestoreReport> {
+        commands::snapshot::execute_restore(&self.client, &self.config, snapshot_config, snapshot_id)
+            .await
+    }
+
+    /// Run enhanced dry-run with EXPLAIN.
+    pub async fn explain(&self) -> Result<ExplainReport> {
+        commands::explain::execute(&self.client, &self.config).await
+    }
+
+    /// Run pre-flight health checks.
+    pub async fn preflight(&self) -> Result<PreflightReport> {
+        preflight::run_preflight(&self.client, &self.config.preflight).await
+    }
+
+    /// Check for branch conflicts (no DB required).
+    pub fn check_conflicts(
+        locations: &[PathBuf],
+        base_branch: &str,
+    ) -> Result<ConflictReport> {
+        commands::check_conflicts::execute(locations, base_branch)
     }
 }

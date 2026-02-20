@@ -36,9 +36,11 @@ fn test_config(schema: &str, migrations_dir: &str) -> WaypointConfig {
             clean_enabled: true,
             baseline_version: "1".to_string(),
             installed_by: None,
+            ..Default::default()
         },
         hooks: HooksConfig::default(),
         placeholders: HashMap::new(),
+        ..Default::default()
     }
 }
 

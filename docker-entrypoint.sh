@@ -1,9 +1,6 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
-SCRIPT_HOME="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-
-# Default values
 DB_HOST="${DB_HOST:-localhost}"
 DB_PORT="${DB_PORT:-5432}"
 DB_NAME="${DB_NAME:-postgres}"
@@ -13,19 +10,24 @@ CONNECT_RETRIES="${CONNECT_RETRIES:-50}"
 SSL_MODE="${SSL_MODE:-prefer}"
 LOCATIONS="${LOCATIONS:-/waypoint/sql}"
 
-echo "Rebuilding local DB started..."
-base="$(date +%s)"
+# Build postgres:// connection URL
+if [ -n "$DB_PASSWORD" ]; then
+  DATABASE_URL="postgres://${DB_USERNAME}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+else
+  DATABASE_URL="postgres://${DB_USERNAME}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+fi
 
-cd "$SCRIPT_HOME"
+# Allow full URL override via WAYPOINT_DATABASE_URL
+DATABASE_URL="${WAYPOINT_DATABASE_URL:-$DATABASE_URL}"
+export WAYPOINT_DATABASE_URL="$DATABASE_URL"
 
-waypoint \
-  --url "jdbc:postgresql://${DB_HOST}:${DB_PORT}/${DB_NAME}?user=${DB_USERNAME}&password=${DB_PASSWORD}" \
-  --locations "${LOCATIONS}" \
-  --out-of-order \
-  --connect-retries "${CONNECT_RETRIES}" \
-  --ssl-mode "${SSL_MODE}" \
-  migrate
+# If no arguments, default to migrate
+COMMAND="${1:-migrate}"
+shift 2>/dev/null || true
 
-after="$(date +%s)"
-elapsed_seconds="$(expr $after - $base)"
-echo "Full Database build successfully completed in ${elapsed_seconds} seconds."
+exec waypoint \
+  --url "$DATABASE_URL" \
+  --locations "$LOCATIONS" \
+  --connect-retries "$CONNECT_RETRIES" \
+  --ssl-mode "$SSL_MODE" \
+  "$COMMAND" "$@"

@@ -52,6 +52,6 @@ pub async fn execute(
     )
     .await?;
 
-    tracing::info!(version = %version, schema = %schema, "Successfully baselined schema");
+    log::info!("Successfully baselined schema; version={}, schema={}", version, schema);
     Ok(())
 }

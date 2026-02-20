@@ -42,24 +42,46 @@ impl std::str::FromStr for SslMode {
 /// Top-level configuration for Waypoint.
 #[derive(Debug, Clone, Default)]
 pub struct WaypointConfig {
+    /// Database connection settings (URL, host, port, credentials, etc.).
     pub database: DatabaseConfig,
+    /// Migration behavior settings (locations, table name, ordering, etc.).
     pub migrations: MigrationSettings,
+    /// SQL callback hook configuration for before/after migration phases.
     pub hooks: HooksConfig,
+    /// Key-value placeholder substitutions applied to migration SQL.
     pub placeholders: HashMap<String, String>,
+    /// Lint rule configuration.
+    pub lint: LintConfig,
+    /// Schema snapshot configuration for drift detection.
+    pub snapshots: crate::commands::snapshot::SnapshotConfig,
+    /// Pre-flight check configuration run before migrations.
+    pub preflight: crate::preflight::PreflightConfig,
+    /// Optional multi-database configuration for parallel migration targets.
+    pub multi_database: Option<Vec<crate::multi::NamedDatabaseConfig>>,
 }
 
 /// Database connection configuration.
 #[derive(Clone)]
 pub struct DatabaseConfig {
+    /// Full connection URL (e.g., `postgres://user:pass@host/db`).
     pub url: Option<String>,
+    /// Database server hostname.
     pub host: Option<String>,
+    /// Database server port number.
     pub port: Option<u16>,
+    /// Database user for authentication.
     pub user: Option<String>,
+    /// Database password for authentication.
     pub password: Option<String>,
+    /// Database name to connect to.
     pub database: Option<String>,
+    /// Number of times to retry a failed connection (max 20).
     pub connect_retries: u32,
+    /// SSL/TLS mode for the database connection.
     pub ssl_mode: SslMode,
+    /// Connection timeout in seconds.
     pub connect_timeout_secs: u32,
+    /// Statement timeout in seconds (0 means no timeout).
     pub statement_timeout_secs: u32,
 }
 
@@ -100,23 +122,48 @@ impl fmt::Debug for DatabaseConfig {
 /// Hook configuration for running SQL before/after migrations.
 #[derive(Debug, Clone, Default)]
 pub struct HooksConfig {
+    /// SQL scripts to run once before the entire migration run.
     pub before_migrate: Vec<PathBuf>,
+    /// SQL scripts to run once after the entire migration run.
     pub after_migrate: Vec<PathBuf>,
+    /// SQL scripts to run before each individual migration.
     pub before_each_migrate: Vec<PathBuf>,
+    /// SQL scripts to run after each individual migration.
     pub after_each_migrate: Vec<PathBuf>,
+}
+
+/// Lint configuration.
+#[derive(Debug, Clone, Default)]
+pub struct LintConfig {
+    /// List of lint rule names to disable.
+    pub disabled_rules: Vec<String>,
 }
 
 /// Migration behavior settings.
 #[derive(Debug, Clone)]
 pub struct MigrationSettings {
+    /// Filesystem directories to scan for migration SQL files.
     pub locations: Vec<PathBuf>,
+    /// Name of the schema history table.
     pub table: String,
+    /// Database schema where the history table resides.
     pub schema: String,
+    /// Whether to allow applying migrations with versions below the highest applied version.
     pub out_of_order: bool,
+    /// Whether to validate already-applied migration checksums before migrating.
     pub validate_on_migrate: bool,
+    /// Whether the `clean` command is allowed to run.
     pub clean_enabled: bool,
+    /// Version to use when running the `baseline` command.
     pub baseline_version: String,
+    /// Custom value for the `installed_by` column (defaults to database user).
     pub installed_by: Option<String>,
+    /// Logical environment name (e.g., "production", "staging") for filtering.
+    pub environment: Option<String>,
+    /// Whether to use `@depends` directives to order migrations topologically.
+    pub dependency_ordering: bool,
+    /// Whether to display a progress indicator during migration.
+    pub show_progress: bool,
 }
 
 impl Default for MigrationSettings {
@@ -130,6 +177,9 @@ impl Default for MigrationSettings {
             clean_enabled: false,
             baseline_version: "1".to_string(),
             installed_by: None,
+            environment: None,
+            dependency_ordering: false,
+            show_progress: true,
         }
     }
 }
@@ -142,6 +192,10 @@ struct TomlConfig {
     migrations: Option<TomlMigrationSettings>,
     hooks: Option<TomlHooksConfig>,
     placeholders: Option<HashMap<String, String>>,
+    lint: Option<TomlLintConfig>,
+    snapshots: Option<TomlSnapshotConfig>,
+    preflight: Option<TomlPreflightConfig>,
+    databases: Option<Vec<TomlNamedDatabaseConfig>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -168,6 +222,38 @@ struct TomlMigrationSettings {
     clean_enabled: Option<bool>,
     baseline_version: Option<String>,
     installed_by: Option<String>,
+    environment: Option<String>,
+    dependency_ordering: Option<bool>,
+    show_progress: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlLintConfig {
+    disabled_rules: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlSnapshotConfig {
+    directory: Option<String>,
+    auto_snapshot_on_migrate: Option<bool>,
+    max_snapshots: Option<usize>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlPreflightConfig {
+    enabled: Option<bool>,
+    max_replication_lag_mb: Option<i64>,
+    long_query_threshold_secs: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlNamedDatabaseConfig {
+    name: Option<String>,
+    url: Option<String>,
+    depends_on: Option<Vec<String>>,
+    migrations: Option<TomlMigrationSettings>,
+    hooks: Option<TomlHooksConfig>,
+    placeholders: Option<HashMap<String, String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -181,17 +267,32 @@ struct TomlHooksConfig {
 /// CLI overrides that take highest priority.
 #[derive(Debug, Default, Clone)]
 pub struct CliOverrides {
+    /// Override database connection URL.
     pub url: Option<String>,
+    /// Override the database schema for the history table.
     pub schema: Option<String>,
+    /// Override the schema history table name.
     pub table: Option<String>,
+    /// Override migration file locations.
     pub locations: Option<Vec<PathBuf>>,
+    /// Override whether out-of-order migrations are allowed.
     pub out_of_order: Option<bool>,
+    /// Override whether to validate checksums on migrate.
     pub validate_on_migrate: Option<bool>,
+    /// Override the baseline version string.
     pub baseline_version: Option<String>,
+    /// Override the number of connection retries.
     pub connect_retries: Option<u32>,
+    /// Override the SSL/TLS connection mode.
     pub ssl_mode: Option<String>,
+    /// Override the connection timeout in seconds.
     pub connect_timeout: Option<u32>,
+    /// Override the statement timeout in seconds.
     pub statement_timeout: Option<u32>,
+    /// Override the logical environment name.
+    pub environment: Option<String>,
+    /// Override whether to use dependency-based migration ordering.
+    pub dependency_ordering: Option<bool>,
 }
 
 impl WaypointConfig {
@@ -213,11 +314,7 @@ impl WaypointConfig {
                 if let Ok(meta) = std::fs::metadata(toml_path) {
                     let mode = meta.permissions().mode();
                     if mode & 0o077 != 0 {
-                        tracing::warn!(
-                            path = %toml_path,
-                            mode = format!("{:o}", mode),
-                            "Config file has overly permissive permissions. Consider chmod 600."
-                        );
+                        log::warn!("Config file has overly permissive permissions. Consider chmod 600.; path={}, mode={:o}", toml_path, mode);
                     }
                 }
             }
@@ -249,7 +346,7 @@ impl WaypointConfig {
         // Cap connect_retries at 20
         if config.database.connect_retries > 20 {
             config.database.connect_retries = 20;
-            tracing::warn!("connect_retries capped at 20");
+            log::warn!("connect_retries capped at 20");
         }
 
         Ok(config)
@@ -316,6 +413,15 @@ impl WaypointConfig {
             if let Some(v) = m.installed_by {
                 self.migrations.installed_by = Some(v);
             }
+            if let Some(v) = m.environment {
+                self.migrations.environment = Some(v);
+            }
+            if let Some(v) = m.dependency_ordering {
+                self.migrations.dependency_ordering = v;
+            }
+            if let Some(v) = m.show_progress {
+                self.migrations.show_progress = v;
+            }
         }
 
         if let Some(h) = toml.hooks {
@@ -335,6 +441,87 @@ impl WaypointConfig {
 
         if let Some(p) = toml.placeholders {
             self.placeholders.extend(p);
+        }
+
+        if let Some(l) = toml.lint {
+            if let Some(v) = l.disabled_rules {
+                self.lint.disabled_rules = v;
+            }
+        }
+
+        if let Some(s) = toml.snapshots {
+            if let Some(v) = s.directory {
+                self.snapshots.directory = PathBuf::from(v);
+            }
+            if let Some(v) = s.auto_snapshot_on_migrate {
+                self.snapshots.auto_snapshot_on_migrate = v;
+            }
+            if let Some(v) = s.max_snapshots {
+                self.snapshots.max_snapshots = v;
+            }
+        }
+
+        if let Some(p) = toml.preflight {
+            if let Some(v) = p.enabled {
+                self.preflight.enabled = v;
+            }
+            if let Some(v) = p.max_replication_lag_mb {
+                self.preflight.max_replication_lag_mb = v;
+            }
+            if let Some(v) = p.long_query_threshold_secs {
+                self.preflight.long_query_threshold_secs = v;
+            }
+        }
+
+        if let Some(databases) = toml.databases {
+            let mut named_dbs = Vec::new();
+            for db in databases {
+                let name = db.name.unwrap_or_default();
+                let mut db_config = DatabaseConfig::default();
+                if let Some(url) = db.url {
+                    db_config.url = Some(url);
+                }
+                // Check for per-database env var
+                let env_url_key = format!("WAYPOINT_DB_{}_URL", name.to_uppercase());
+                if let Ok(url) = std::env::var(&env_url_key) {
+                    db_config.url = Some(url);
+                }
+
+                let mut mig_settings = MigrationSettings::default();
+                if let Some(m) = db.migrations {
+                    if let Some(v) = m.locations {
+                        mig_settings.locations = v.into_iter().map(|s| normalize_location(&s)).collect();
+                    }
+                    if let Some(v) = m.table { mig_settings.table = v; }
+                    if let Some(v) = m.schema { mig_settings.schema = v; }
+                    if let Some(v) = m.out_of_order { mig_settings.out_of_order = v; }
+                    if let Some(v) = m.validate_on_migrate { mig_settings.validate_on_migrate = v; }
+                    if let Some(v) = m.clean_enabled { mig_settings.clean_enabled = v; }
+                    if let Some(v) = m.baseline_version { mig_settings.baseline_version = v; }
+                    if let Some(v) = m.installed_by { mig_settings.installed_by = Some(v); }
+                    if let Some(v) = m.environment { mig_settings.environment = Some(v); }
+                    if let Some(v) = m.dependency_ordering { mig_settings.dependency_ordering = v; }
+                    if let Some(v) = m.show_progress { mig_settings.show_progress = v; }
+                }
+
+                let mut hooks_config = HooksConfig::default();
+                if let Some(h) = db.hooks {
+                    if let Some(v) = h.before_migrate { hooks_config.before_migrate = v.into_iter().map(PathBuf::from).collect(); }
+                    if let Some(v) = h.after_migrate { hooks_config.after_migrate = v.into_iter().map(PathBuf::from).collect(); }
+                    if let Some(v) = h.before_each_migrate { hooks_config.before_each_migrate = v.into_iter().map(PathBuf::from).collect(); }
+                    if let Some(v) = h.after_each_migrate { hooks_config.after_each_migrate = v.into_iter().map(PathBuf::from).collect(); }
+                }
+
+                named_dbs.push(crate::multi::NamedDatabaseConfig {
+                    name,
+                    database: db_config,
+                    migrations: mig_settings,
+                    hooks: hooks_config,
+                    placeholders: db.placeholders.unwrap_or_default(),
+                    depends_on: db.depends_on.unwrap_or_default(),
+                });
+            }
+            self.multi_database = Some(named_dbs);
         }
     }
 
@@ -390,6 +577,10 @@ impl WaypointConfig {
             self.migrations.schema = v;
         }
 
+        if let Ok(v) = std::env::var("WAYPOINT_ENVIRONMENT") {
+            self.migrations.environment = Some(v);
+        }
+
         // Scan for placeholder env vars: WAYPOINT_PLACEHOLDER_{KEY}
         for (key, value) in std::env::vars() {
             if let Some(placeholder_key) = key.strip_prefix("WAYPOINT_PLACEHOLDER_") {
@@ -435,6 +626,12 @@ impl WaypointConfig {
         }
         if let Some(v) = overrides.statement_timeout {
             self.database.statement_timeout_secs = v;
+        }
+        if let Some(ref v) = overrides.environment {
+            self.migrations.environment = Some(v.clone());
+        }
+        if let Some(v) = overrides.dependency_ordering {
+            self.migrations.dependency_ordering = v;
         }
     }
 
@@ -609,6 +806,8 @@ mod tests {
             ssl_mode: None,
             connect_timeout: None,
             statement_timeout: None,
+            environment: None,
+            dependency_ordering: None,
         };
 
         config.apply_cli(&overrides);

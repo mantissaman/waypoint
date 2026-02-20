@@ -9,15 +9,25 @@ use crate::error::Result;
 /// A row from the schema history table.
 #[derive(Debug, Clone)]
 pub struct AppliedMigration {
+    /// Monotonically increasing rank indicating the order of installation.
     pub installed_rank: i32,
+    /// Migration version string, or `None` for repeatable migrations.
     pub version: Option<String>,
+    /// Human-readable description of the migration.
     pub description: String,
+    /// Type of migration (e.g., `"SQL"`, `"SQL_REPEATABLE"`, `"UNDO_SQL"`, `"BASELINE"`).
     pub migration_type: String,
+    /// Filename of the migration script.
     pub script: String,
+    /// CRC32 checksum of the migration SQL, or `None` for baselines.
     pub checksum: Option<i32>,
+    /// Database user or custom identifier that applied the migration.
     pub installed_by: String,
+    /// Timestamp when the migration was applied.
     pub installed_on: DateTime<Utc>,
+    /// Time in milliseconds the migration took to execute.
     pub execution_time: i32,
+    /// Whether the migration completed successfully.
     pub success: bool,
 }
 
@@ -205,6 +215,29 @@ pub async fn update_repeatable_checksum(
     );
     client.execute(&sql, &[&new_checksum, &script]).await?;
     Ok(())
+}
+
+/// Compute the set of versions that are currently effectively applied.
+///
+/// Processes history rows in `installed_rank` order (assumed already sorted).
+/// For each version, tracks whether the latest successful action was a forward
+/// migration (`"SQL"` / `"BASELINE"`) or an undo (`"UNDO_SQL"`).
+/// Returns the set of version strings that are currently applied.
+pub fn effective_applied_versions(applied: &[AppliedMigration]) -> std::collections::HashSet<String> {
+    let mut effective = std::collections::HashSet::new();
+    for am in applied {
+        if !am.success {
+            continue;
+        }
+        if let Some(ref version) = am.version {
+            if am.migration_type == "UNDO_SQL" {
+                effective.remove(version);
+            } else {
+                effective.insert(version.clone());
+            }
+        }
+    }
+    effective
 }
 
 /// Check if the history table has any entries.

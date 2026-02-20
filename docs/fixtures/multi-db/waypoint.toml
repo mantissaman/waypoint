@@ -1,0 +1,18 @@
+# Multi-database waypoint configuration
+# Each database is migrated in dependency order
+
+[[databases]]
+name = "auth_db"
+url = "postgres://postgres:postgres@localhost:5432/waypoint_test_auth"
+depends_on = []
+
+[databases.migrations]
+locations = ["docs/fixtures/multi-db/auth"]
+
+[[databases]]
+name = "app_db"
+url = "postgres://postgres:postgres@localhost:5432/waypoint_test_app"
+depends_on = ["auth_db"]
+
+[databases.migrations]
+locations = ["docs/fixtures/multi-db/app"]

@@ -13,8 +13,11 @@ use crate::migration::{scan_migrations, ResolvedMigration};
 /// Report returned after a validate operation.
 #[derive(Debug, Serialize)]
 pub struct ValidateReport {
+    /// Whether all validations passed without errors.
     pub valid: bool,
+    /// Validation errors (e.g. checksum mismatches) that indicate corruption.
     pub issues: Vec<String>,
+    /// Non-fatal warnings (e.g. missing files on disk).
     pub warnings: Vec<String>,
 }
 
@@ -63,6 +66,9 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Validat
         if am.migration_type == "BASELINE" {
             continue;
         }
+        if am.migration_type == "UNDO_SQL" {
+            continue;
+        }
 
         // Distinguish by version presence for Flyway compatibility
         if am.version.is_some() {
@@ -99,12 +105,7 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Validat
 
     let valid = issues.is_empty();
 
-    tracing::info!(
-        valid = valid,
-        issue_count = issues.len(),
-        warning_count = warnings.len(),
-        "Validation completed"
-    );
+    log::info!("Validation completed; valid={}, issue_count={}, warning_count={}", valid, issues.len(), warnings.len());
 
     if !valid {
         return Err(WaypointError::ValidationFailed(issues.join("\n")));

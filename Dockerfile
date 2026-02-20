@@ -1,10 +1,9 @@
 # Stage 1: Build
-FROM rust:1-bookworm AS builder
+FROM rust:1-alpine AS builder
+
+RUN apk add --no-cache musl-dev git
 
 WORKDIR /usr/src/waypoint
-
-# Install git for build.rs (captures commit hash)
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests first for layer caching
 COPY Cargo.toml Cargo.lock ./
@@ -27,18 +26,15 @@ COPY waypoint-cli/ waypoint-cli/
 COPY .gi[t] .git
 
 # Touch sources so cargo detects changes over dummy build
-# (Docker COPY preserves original file timestamps)
 RUN touch waypoint-core/src/lib.rs waypoint-cli/src/main.rs
 
 # Build release binary
 RUN cargo build --release --bin waypoint
 
 # Stage 2: Minimal runtime image
-FROM debian:bookworm-slim
+FROM alpine:3.21
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates
 
 COPY --from=builder /usr/src/waypoint/target/release/waypoint /usr/local/bin/waypoint
 

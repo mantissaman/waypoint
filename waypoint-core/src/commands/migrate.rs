@@ -7,28 +7,58 @@ use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;
 use crate::db;
+use crate::directive::MigrationDirectives;
 use crate::error::{Result, WaypointError};
 use crate::history;
 use crate::hooks::{self, HookType, ResolvedHook};
 use crate::migration::{scan_migrations, MigrationVersion, ResolvedMigration};
 use crate::placeholder::{build_placeholders, replace_placeholders};
 
+/// Check if a migration should run in the current environment.
+///
+/// Returns true if:
+/// - The migration has no env directives (runs everywhere)
+/// - No environment is configured (runs everything)
+/// - The migration's env list includes the current environment
+fn should_run_in_environment(directives: &MigrationDirectives, current_env: Option<&str>) -> bool {
+    // No env directives = runs everywhere
+    if directives.env.is_empty() {
+        return true;
+    }
+    // No environment configured = runs everything
+    let env = match current_env {
+        Some(e) => e,
+        None => return true,
+    };
+    // Check if current env matches any directive
+    directives.env.iter().any(|e| e.eq_ignore_ascii_case(env))
+}
+
 /// Report returned after a migrate operation.
 #[derive(Debug, Serialize)]
 pub struct MigrateReport {
+    /// Number of migrations that were applied in this run.
     pub migrations_applied: usize,
+    /// Total execution time of all migrations in milliseconds.
     pub total_time_ms: i32,
+    /// Per-migration details for each applied migration.
     pub details: Vec<MigrateDetail>,
+    /// Number of lifecycle hooks that were executed.
     pub hooks_executed: usize,
+    /// Total execution time of all hooks in milliseconds.
     pub hooks_time_ms: i32,
 }
 
 /// Details of a single applied migration within a migrate run.
 #[derive(Debug, Serialize)]
 pub struct MigrateDetail {
+    /// Version string, or None for repeatable migrations.
     pub version: Option<String>,
+    /// Human-readable description from the migration filename.
     pub description: String,
+    /// Filename of the migration script.
     pub script: String,
+    /// Execution time of this migration in milliseconds.
     pub execution_time_ms: i32,
 }
 
@@ -47,20 +77,15 @@ pub async fn execute(
 
     // Always release the advisory lock
     if let Err(e) = db::release_advisory_lock(client, table).await {
-        tracing::warn!(error = %e, "Failed to release advisory lock");
+        log::warn!("Failed to release advisory lock: {}", e);
     }
 
     match &result {
         Ok(report) => {
-            tracing::info!(
-                migrations_applied = report.migrations_applied,
-                total_time_ms = report.total_time_ms,
-                hooks_executed = report.hooks_executed,
-                "Migrate completed"
-            );
+            log::info!("Migrate completed; migrations_applied={}, total_time_ms={}, hooks_executed={}", report.migrations_applied, report.total_time_ms, report.hooks_executed);
         }
         Err(e) => {
-            tracing::error!(error = %e, "Migrate failed");
+            log::error!("Migrate failed: {}", e);
         }
     }
 
@@ -85,9 +110,25 @@ async fn run_migrate(
             match &e {
                 WaypointError::ValidationFailed(_) => return Err(e),
                 _ => {
-                    tracing::debug!("Validation skipped: {}", e);
+                    log::debug!("Validation skipped: {}", e);
                 }
             }
+        }
+    }
+
+    // Run preflight checks if enabled
+    if config.preflight.enabled {
+        let preflight_report = crate::preflight::run_preflight(client, &config.preflight).await?;
+        if !preflight_report.passed {
+            let failed_checks: Vec<String> = preflight_report
+                .checks
+                .iter()
+                .filter(|c| c.status == crate::preflight::CheckStatus::Fail)
+                .map(|c| format!("{}: {}", c.name, c.detail))
+                .collect();
+            return Err(WaypointError::PreflightFailed {
+                checks: failed_checks.join("; "),
+            });
         }
     }
 
@@ -126,21 +167,14 @@ async fn run_migrate(
         .map(|v| MigrationVersion::parse(v))
         .transpose()?;
 
-    // Find highest applied versioned migration (version presence, not type string,
-    // for Flyway compatibility)
-    let highest_applied = applied
+    // Compute effective applied versions (respects undo state)
+    let effective_versions = history::effective_applied_versions(&applied);
+
+    // Find highest effectively-applied versioned migration
+    let highest_applied = effective_versions
         .iter()
-        .filter(|a| a.success && a.version.is_some())
-        .filter_map(|a| a.version.as_ref())
         .filter_map(|v| MigrationVersion::parse(v).ok())
         .max();
-
-    // Build set of applied versions and scripts for quick lookup
-    let applied_versions: HashMap<String, &crate::history::AppliedMigration> = applied
-        .iter()
-        .filter(|a| a.success)
-        .filter_map(|a| a.version.as_ref().map(|v| (v.clone(), a)))
-        .collect();
 
     let applied_scripts: HashMap<String, &crate::history::AppliedMigration> = applied
         .iter()
@@ -176,20 +210,25 @@ async fn run_migrate(
     report.hooks_time_ms += ms;
 
     // ── Apply versioned migrations ──
-    let versioned: Vec<&ResolvedMigration> = resolved.iter().filter(|m| m.is_versioned()).collect();
+    let current_env = config.migrations.environment.as_deref();
+    let versioned: Vec<&ResolvedMigration> = resolved
+        .iter()
+        .filter(|m| m.is_versioned())
+        .filter(|m| should_run_in_environment(&m.directives, current_env))
+        .collect();
 
     for migration in &versioned {
         let version = migration.version().unwrap();
 
-        // Skip if already applied successfully
-        if applied_versions.contains_key(&version.raw) {
+        // Skip if already effectively applied (respects undo state)
+        if effective_versions.contains(&version.raw) {
             continue;
         }
 
         // Skip if below baseline
         if let Some(ref bv) = baseline_version {
             if version <= bv {
-                tracing::debug!("Skipping {} (below baseline)", migration.script);
+                log::debug!("Skipping {} (below baseline)", migration.script);
                 continue;
             }
         }
@@ -197,7 +236,7 @@ async fn run_migrate(
         // Check target version
         if let Some(ref tv) = target {
             if version > tv {
-                tracing::debug!("Skipping {} (above target {})", migration.script, tv);
+                log::debug!("Skipping {} (above target {})", migration.script, tv);
                 break;
             }
         }
@@ -269,8 +308,11 @@ async fn run_migrate(
     }
 
     // ── Apply repeatable migrations ──
-    let repeatables: Vec<&ResolvedMigration> =
-        resolved.iter().filter(|m| !m.is_versioned()).collect();
+    let repeatables: Vec<&ResolvedMigration> = resolved
+        .iter()
+        .filter(|m| !m.is_versioned() && !m.is_undo())
+        .filter(|m| should_run_in_environment(&m.directives, current_env))
+        .collect();
 
     for migration in &repeatables {
         // Check if already applied with same checksum
@@ -279,7 +321,7 @@ async fn run_migrate(
                 continue; // Unchanged, skip
             }
             // Checksum differs — re-apply (outdated)
-            tracing::info!(migration = %migration.script, "Re-applying changed repeatable migration");
+            log::info!("Re-applying changed repeatable migration; migration={}", migration.script);
         }
 
         // beforeEachMigrate hooks
@@ -368,7 +410,7 @@ async fn apply_migration(
     db_user: &str,
     db_name: &str,
 ) -> Result<i32> {
-    tracing::info!(migration = %migration.script, schema = %schema, "Applying migration");
+    log::info!("Applying migration; migration={}, schema={}", migration.script, schema);
 
     // Build placeholders
     let placeholders = build_placeholders(
@@ -423,7 +465,7 @@ async fn apply_migration(
             )
             .await
             {
-                tracing::warn!(script = %migration.script, error = %record_err, "Failed to record migration failure in history table");
+                log::warn!("Failed to record migration failure in history table; script={}, error={}", migration.script, record_err);
             }
 
             // Extract detailed error message
@@ -431,7 +473,7 @@ async fn apply_migration(
                 WaypointError::DatabaseError(db_err) => crate::error::format_db_error(db_err),
                 other => other.to_string(),
             };
-            tracing::error!(script = %migration.script, reason = %reason, "Migration failed");
+            log::error!("Migration failed; script={}, reason={}", migration.script, reason);
             Err(WaypointError::MigrationFailed {
                 script: migration.script.clone(),
                 reason,

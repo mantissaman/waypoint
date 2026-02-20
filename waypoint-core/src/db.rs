@@ -1,6 +1,6 @@
 //! Database connection, TLS support, advisory locking, and transaction execution.
 
-use rand::Rng;
+use fastrand;
 use tokio_postgres::Client;
 
 use crate::config::SslMode;
@@ -32,13 +32,17 @@ pub fn validate_identifier(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Build a rustls ClientConfig using the Mozilla CA bundle.
+/// Build a rustls ClientConfig using the Mozilla CA bundle and ring crypto provider.
 fn make_rustls_config() -> rustls::ClientConfig {
     let root_store =
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth()
+    rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(root_store)
+    .with_no_client_auth()
 }
 
 /// Check if a postgres error is a permanent authentication failure that should not be retried.
@@ -66,7 +70,7 @@ async fn connect_once(
                     tokio_postgres::connect(conn_string, tokio_postgres::NoTls).await?;
                 tokio::spawn(async move {
                     if let Err(e) = connection.await {
-                        tracing::error!(error = %e, "Database connection error");
+                        log::error!("Database connection error: {}", e);
                     }
                 });
                 Ok(client)
@@ -77,7 +81,7 @@ async fn connect_once(
                 let (client, connection) = tokio_postgres::connect(conn_string, tls).await?;
                 tokio::spawn(async move {
                     if let Err(e) = connection.await {
-                        tracing::error!(error = %e, "Database connection error");
+                        log::error!("Database connection error: {}", e);
                     }
                 });
                 Ok(client)
@@ -90,18 +94,18 @@ async fn connect_once(
                     Ok((client, connection)) => {
                         tokio::spawn(async move {
                             if let Err(e) = connection.await {
-                                tracing::error!(error = %e, "Database connection error");
+                                log::error!("Database connection error: {}", e);
                             }
                         });
                         Ok(client)
                     }
                     Err(_) => {
-                        tracing::debug!("TLS connection failed, falling back to plaintext");
+                        log::debug!("TLS connection failed, falling back to plaintext");
                         let (client, connection) =
                             tokio_postgres::connect(conn_string, tokio_postgres::NoTls).await?;
                         tokio::spawn(async move {
                             if let Err(e) = connection.await {
-                                tracing::error!(error = %e, "Database connection error");
+                                log::error!("Database connection error: {}", e);
                             }
                         });
                         Ok(client)
@@ -149,26 +153,17 @@ pub async fn connect_with_config(
     for attempt in 0..=retries {
         if attempt > 0 {
             let base_delay = std::cmp::min(1u64 << attempt, 30);
-            let jitter_ms = rand::thread_rng().gen_range(0..1000);
+            let jitter_ms = fastrand::u64(0..1000);
             let delay = std::time::Duration::from_secs(base_delay)
                 + std::time::Duration::from_millis(jitter_ms);
-            tracing::info!(
-                attempt = attempt + 1,
-                max_attempts = retries + 1,
-                delay_ms = delay.as_millis() as u64,
-                "Connection attempt failed, retrying"
-            );
+            log::info!("Connection attempt failed, retrying; attempt={}, max_attempts={}, delay_ms={}", attempt + 1, retries + 1, delay.as_millis() as u64);
             tokio::time::sleep(delay).await;
         }
 
         match connect_once(conn_string, ssl_mode, connect_timeout_secs).await {
             Ok(client) => {
                 if attempt > 0 {
-                    tracing::info!(
-                        attempt = attempt + 1,
-                        max_attempts = retries + 1,
-                        "Connected successfully after retry"
-                    );
+                    log::info!("Connected successfully after retry; attempt={}, max_attempts={}", attempt + 1, retries + 1);
                 }
 
                 // Set statement timeout if configured
@@ -183,7 +178,7 @@ pub async fn connect_with_config(
             Err(e) => {
                 // Don't retry permanent errors (e.g. bad credentials)
                 if is_permanent_error(&e) {
-                    tracing::error!(error = %e, "Permanent connection error, not retrying");
+                    log::error!("Permanent connection error, not retrying: {}", e);
                     return Err(WaypointError::DatabaseError(e));
                 }
                 last_err = Some(e);
@@ -199,7 +194,7 @@ pub async fn connect_with_config(
 /// This prevents concurrent migration runs from interfering with each other.
 pub async fn acquire_advisory_lock(client: &Client, table_name: &str) -> Result<()> {
     let lock_id = advisory_lock_id(table_name);
-    tracing::info!(lock_id = lock_id, table = %table_name, "Acquiring advisory lock");
+    log::info!("Acquiring advisory lock; lock_id={}, table={}", lock_id, table_name);
 
     client
         .execute(&format!("SELECT pg_advisory_lock({})", lock_id), &[])
@@ -212,7 +207,7 @@ pub async fn acquire_advisory_lock(client: &Client, table_name: &str) -> Result<
 /// Release the PostgreSQL advisory lock.
 pub async fn release_advisory_lock(client: &Client, table_name: &str) -> Result<()> {
     let lock_id = advisory_lock_id(table_name);
-    tracing::info!(lock_id = lock_id, table = %table_name, "Releasing advisory lock");
+    log::info!("Releasing advisory lock; lock_id={}, table={}", lock_id, table_name);
 
     client
         .execute(&format!("SELECT pg_advisory_unlock({})", lock_id), &[])
@@ -256,7 +251,7 @@ pub async fn execute_in_transaction(client: &Client, sql: &str) -> Result<i32> {
         }
         Err(e) => {
             if let Err(rollback_err) = client.batch_execute("ROLLBACK").await {
-                tracing::warn!(error = %rollback_err, "Failed to rollback transaction");
+                log::warn!("Failed to rollback transaction: {}", rollback_err);
             }
             return Err(WaypointError::DatabaseError(e));
         }

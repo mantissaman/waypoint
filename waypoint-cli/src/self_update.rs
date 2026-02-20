@@ -1,3 +1,7 @@
+//! Self-update mechanism via the GitHub Releases API.
+//! Downloads platform-specific binaries and performs atomic
+//! in-place replacement, with a fallback to install.sh.
+
 use std::env;
 use std::fs;
 use std::io::Read;
@@ -13,44 +17,39 @@ const REPO: &str = "mantissaman/waypoint";
 const INSTALL_SH_URL: &str =
     "https://raw.githubusercontent.com/mantissaman/waypoint/main/install.sh";
 
+/// Minimal representation of a GitHub release for version checking.
 #[derive(serde::Deserialize)]
 struct GitHubRelease {
     tag_name: String,
 }
 
+/// Parse the compile-time crate version into a semver Version.
 fn current_version() -> Result<Version, WaypointError> {
     Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|e| WaypointError::UpdateError(format!("Failed to parse current version: {e}")))
 }
 
-async fn fetch_latest_release() -> Result<GitHubRelease, WaypointError> {
+/// Fetch the latest release metadata from the GitHub API.
+fn fetch_latest_release() -> Result<GitHubRelease, WaypointError> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(&url)
+    let resp: GitHubRelease = ureq::get(&url)
         .header("User-Agent", "waypoint-self-update")
-        .send()
-        .await
-        .map_err(|e| WaypointError::UpdateError(format!("Failed to fetch latest release: {e}")))?;
-
-    if !resp.status().is_success() {
-        return Err(WaypointError::UpdateError(format!(
-            "GitHub API returned status {}",
-            resp.status()
-        )));
-    }
-
-    resp.json::<GitHubRelease>()
-        .await
-        .map_err(|e| WaypointError::UpdateError(format!("Failed to parse release JSON: {e}")))
+        .call()
+        .map_err(|e| WaypointError::UpdateError(format!("Failed to fetch latest release: {e}")))?
+        .body_mut()
+        .read_json()
+        .map_err(|e| WaypointError::UpdateError(format!("Failed to parse release JSON: {e}")))?;
+    Ok(resp)
 }
 
+/// Parse a GitHub release tag (with optional 'v' prefix) into a semver Version.
 fn parse_version(tag: &str) -> Result<Version, WaypointError> {
     let v = tag.strip_prefix('v').unwrap_or(tag);
     Version::parse(v)
         .map_err(|e| WaypointError::UpdateError(format!("Failed to parse version '{tag}': {e}")))
 }
 
+/// Detect the current OS and architecture for release asset selection.
 fn platform_target() -> Result<(&'static str, &'static str), WaypointError> {
     let os = match env::consts::OS {
         "linux" => "linux",
@@ -75,7 +74,8 @@ fn platform_target() -> Result<(&'static str, &'static str), WaypointError> {
     Ok((os, arch))
 }
 
-async fn download_and_replace(version: &str) -> Result<(), WaypointError> {
+/// Download a release tarball and atomically replace the current binary.
+fn download_and_replace(version: &str) -> Result<(), WaypointError> {
     let (os, arch) = platform_target()?;
     let tag = if version.starts_with('v') {
         version.to_string()
@@ -87,24 +87,14 @@ async fn download_and_replace(version: &str) -> Result<(), WaypointError> {
 
     eprintln!("Downloading {}...", url);
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(&url)
+    let mut resp = ureq::get(&url)
         .header("User-Agent", "waypoint-self-update")
-        .send()
-        .await
+        .call()
         .map_err(|e| WaypointError::UpdateError(format!("Download failed: {e}")))?;
 
-    if !resp.status().is_success() {
-        return Err(WaypointError::UpdateError(format!(
-            "Download returned status {} for {url}",
-            resp.status()
-        )));
-    }
-
     let bytes = resp
-        .bytes()
-        .await
+        .body_mut()
+        .read_to_vec()
         .map_err(|e| WaypointError::UpdateError(format!("Failed to read response body: {e}")))?;
 
     // Extract the binary from the tar.gz
@@ -166,6 +156,7 @@ async fn download_and_replace(version: &str) -> Result<(), WaypointError> {
     Ok(())
 }
 
+/// Fall back to the remote install.sh script when direct update fails.
 fn fallback_install_sh() -> Result<(), WaypointError> {
     eprintln!(
         "{}",
@@ -185,9 +176,10 @@ fn fallback_install_sh() -> Result<(), WaypointError> {
     Ok(())
 }
 
-pub async fn self_update(check_only: bool, json_output: bool) -> Result<(), WaypointError> {
+/// Check for and optionally install the latest waypoint release.
+pub fn self_update(check_only: bool, json_output: bool) -> Result<(), WaypointError> {
     let current = current_version()?;
-    let release = fetch_latest_release().await?;
+    let release = fetch_latest_release()?;
     let latest = parse_version(&release.tag_name)?;
 
     if json_output {
@@ -244,7 +236,7 @@ pub async fn self_update(check_only: bool, json_output: bool) -> Result<(), Wayp
         latest.to_string().green().bold()
     );
 
-    match download_and_replace(&latest.to_string()).await {
+    match download_and_replace(&latest.to_string()) {
         Ok(()) => {
             if json_output {
                 println!(
