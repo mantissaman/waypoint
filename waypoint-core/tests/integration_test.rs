@@ -17,7 +17,7 @@ use waypoint_core::config::{DatabaseConfig, HooksConfig, MigrationSettings, Wayp
 use waypoint_core::db::{self, quote_ident};
 use waypoint_core::dependency::DependencyGraph;
 use waypoint_core::history;
-use waypoint_core::migration::{MigrationVersion, scan_migrations};
+use waypoint_core::migration::{scan_migrations, MigrationVersion};
 use waypoint_core::safety::SafetyVerdict;
 use waypoint_core::Waypoint;
 
@@ -671,14 +671,8 @@ async fn test_undo_with_count() {
             "V3__Third.sql",
             &format!("CREATE TABLE {}.uc_t3 (id SERIAL PRIMARY KEY);", schema),
         ),
-        (
-            "U3__Third.sql",
-            &format!("DROP TABLE {}.uc_t3;", schema),
-        ),
-        (
-            "U2__Second.sql",
-            &format!("DROP TABLE {}.uc_t2;", schema),
-        ),
+        ("U3__Third.sql", &format!("DROP TABLE {}.uc_t3;", schema)),
+        ("U2__Second.sql", &format!("DROP TABLE {}.uc_t2;", schema)),
     ]);
 
     let config = test_config(&schema, migrations.path().to_str().unwrap());
@@ -726,14 +720,8 @@ async fn test_undo_to_target_version() {
             "V3__Third.sql",
             &format!("CREATE TABLE {}.ut_t3 (id SERIAL PRIMARY KEY);", schema),
         ),
-        (
-            "U3__Third.sql",
-            &format!("DROP TABLE {}.ut_t3;", schema),
-        ),
-        (
-            "U2__Second.sql",
-            &format!("DROP TABLE {}.ut_t2;", schema),
-        ),
+        ("U3__Third.sql", &format!("DROP TABLE {}.ut_t3;", schema)),
+        ("U2__Second.sql", &format!("DROP TABLE {}.ut_t2;", schema)),
     ]);
 
     let config = test_config(&schema, migrations.path().to_str().unwrap());
@@ -850,10 +838,9 @@ async fn test_batch_transaction_rollback_on_failure() {
         .await
         .unwrap();
     if history_exists.get::<_, bool>(0) {
-        let applied =
-            history::get_applied_migrations(&conn, &schema, "waypoint_schema_history")
-                .await
-                .unwrap();
+        let applied = history::get_applied_migrations(&conn, &schema, "waypoint_schema_history")
+            .await
+            .unwrap();
         let effective = history::effective_applied_versions(&applied);
         assert!(
             effective.is_empty(),
@@ -878,10 +865,7 @@ async fn test_environment_scoping() {
         ),
         (
             "V2__All_envs.sql",
-            &format!(
-                "CREATE TABLE {}.env_all (id SERIAL PRIMARY KEY);",
-                schema
-            ),
+            &format!("CREATE TABLE {}.env_all (id SERIAL PRIMARY KEY);", schema),
         ),
     ]);
 
@@ -904,7 +888,10 @@ async fn test_environment_scoping() {
         )
         .await
         .unwrap();
-    assert!(!exists_prod.get::<_, bool>(0), "env_prod table should NOT exist in dev environment");
+    assert!(
+        !exists_prod.get::<_, bool>(0),
+        "env_prod table should NOT exist in dev environment"
+    );
 
     let exists_all = conn
         .query_one(
@@ -936,7 +923,10 @@ async fn test_placeholders() {
         .insert("mytable".to_string(), "placeholder_tbl".to_string());
 
     let wp = Waypoint::with_client(config, client);
-    let report = wp.migrate(None).await.expect("migrate with placeholders failed");
+    let report = wp
+        .migrate(None)
+        .await
+        .expect("migrate with placeholders failed");
     assert_eq!(report.migrations_applied, 1);
 
     // Verify the table was created with the replaced name
@@ -979,7 +969,10 @@ async fn test_hooks_before_migrate() {
     // Create a regular migration
     std::fs::write(
         dir.join("V1__Main.sql"),
-        format!("CREATE TABLE {}.hooks_main (id SERIAL PRIMARY KEY);", schema),
+        format!(
+            "CREATE TABLE {}.hooks_main (id SERIAL PRIMARY KEY);",
+            schema
+        ),
     )
     .unwrap();
 
@@ -1013,14 +1006,8 @@ async fn test_dependency_ordering() {
     // Test the DependencyGraph topological sort API directly with
     // migration files that have depends directives.
     let migrations = create_temp_migrations(&[
-        (
-            "V1__Base.sql",
-            "-- No deps\nSELECT 1;",
-        ),
-        (
-            "V2__Depends_on_V1.sql",
-            "-- waypoint:depends 1\nSELECT 1;",
-        ),
+        ("V1__Base.sql", "-- No deps\nSELECT 1;"),
+        ("V2__Depends_on_V1.sql", "-- waypoint:depends 1\nSELECT 1;"),
         (
             "V3__Also_depends_on_V1.sql",
             "-- waypoint:depends 1\nSELECT 1;",
@@ -1073,10 +1060,7 @@ async fn test_snapshot_and_drift() {
 
     // Set search_path to our test schema so unqualified names resolve correctly
     client
-        .batch_execute(&format!(
-            "SET search_path TO {}",
-            quote_ident(&schema)
-        ))
+        .batch_execute(&format!("SET search_path TO {}", quote_ident(&schema)))
         .await
         .unwrap();
 
@@ -1097,17 +1081,11 @@ async fn test_snapshot_and_drift() {
 
     let client2 = db::connect(&get_test_url()).await.unwrap();
     client2
-        .batch_execute(&format!(
-            "SET search_path TO {}",
-            quote_ident(&schema)
-        ))
+        .batch_execute(&format!("SET search_path TO {}", quote_ident(&schema)))
         .await
         .unwrap();
     let wp2 = Waypoint::with_client(config.clone(), client2);
-    let snap_report = wp2
-        .snapshot(&snap_config)
-        .await
-        .expect("snapshot failed");
+    let snap_report = wp2.snapshot(&snap_config).await.expect("snapshot failed");
     assert!(snap_report.objects_captured > 0);
 
     // Now add V2 to alter the table (unqualified)
@@ -1119,10 +1097,7 @@ async fn test_snapshot_and_drift() {
 
     let client3 = db::connect(&get_test_url()).await.unwrap();
     client3
-        .batch_execute(&format!(
-            "SET search_path TO {}",
-            quote_ident(&schema)
-        ))
+        .batch_execute(&format!("SET search_path TO {}", quote_ident(&schema)))
         .await
         .unwrap();
     let wp3 = Waypoint::with_client(config.clone(), client3);
@@ -1132,7 +1107,10 @@ async fn test_snapshot_and_drift() {
     let client4 = db::connect(&get_test_url()).await.unwrap();
     let wp4 = Waypoint::with_client(config.clone(), client4);
     let drift_report = wp4.drift().await.expect("drift detection failed");
-    assert!(!drift_report.has_drift, "No drift should be detected when DB matches migrations");
+    assert!(
+        !drift_report.has_drift,
+        "No drift should be detected when DB matches migrations"
+    );
 
     // Now introduce manual drift by adding a column outside migrations
     let client5 = db::connect(&get_test_url()).await.unwrap();
