@@ -1,4 +1,5 @@
 mod output;
+mod self_update;
 
 use std::process;
 
@@ -128,6 +129,13 @@ enum Commands {
         #[arg(long)]
         allow_clean: bool,
     },
+
+    /// Update waypoint to the latest version
+    SelfUpdate {
+        /// Check for updates without installing
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[tokio::main]
@@ -169,6 +177,7 @@ fn exit_code(error: &WaypointError) -> i32 {
         WaypointError::HookFailed { .. } => 5,
         WaypointError::LockError(_) => 6,
         WaypointError::CleanDisabled => 7,
+        WaypointError::UpdateError(_) => 8,
         _ => 1,
     }
 }
@@ -176,6 +185,11 @@ fn exit_code(error: &WaypointError) -> i32 {
 async fn run(cli: Cli) -> Result<(), WaypointError> {
     let json_output = cli.json;
     let dry_run = cli.dry_run;
+
+    // Handle self-update before config/DB setup (no database needed)
+    if let Commands::SelfUpdate { check } = &cli.command {
+        return self_update::self_update(*check, json_output).await;
+    }
 
     // Build CLI overrides with negation flag support
     let out_of_order = if cli.out_of_order {
@@ -317,6 +331,7 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
                 output::print_clean_result(&dropped);
             }
         }
+        Commands::SelfUpdate { .. } => unreachable!("handled before config loading"),
     }
 
     Ok(())

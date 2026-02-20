@@ -80,6 +80,9 @@ pub enum WaypointError {
         script: String,
         reason: String,
     },
+
+    #[error("Self-update failed: {0}")]
+    UpdateError(String),
 }
 
 /// Convenience type alias for `Result<T, WaypointError>`.
