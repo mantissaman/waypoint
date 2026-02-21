@@ -7,7 +7,7 @@ on:
 
 env:
   REGISTRY: docker.io
-  IMAGE_NAME: tensorbee/waypoint
+  IMAGE_NAME: tensorbeeio/waypoint
 
 jobs:
   build-and-push:

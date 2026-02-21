@@ -13,14 +13,14 @@ docker run --rm \
   -e DB_NAME=mydb \
   -e DB_USERNAME=postgres \
   -e DB_PASSWORD=secret \
-  tensorbee/waypoint
+  tensorbeeio/waypoint
 ```
 
 ## Pull from Docker Hub
 
 ```bash
-docker pull tensorbee/waypoint:latest
-docker pull tensorbee/waypoint:0.1.0    # pinned version
+docker pull tensorbeeio/waypoint:latest
+docker pull tensorbeeio/waypoint:0.1.0    # pinned version
 ```
 
 ## Migrating from Flyway
@@ -33,7 +33,7 @@ FROM flyway/flyway
 COPY migrations /flyway/sql
 
 # After
-FROM tensorbee/waypoint
+FROM tensorbeeio/waypoint
 COPY migrations /waypoint/sql
 ```
 
@@ -76,7 +76,7 @@ services:
       retries: 5
 
   migrate:
-    image: tensorbee/waypoint:latest
+    image: tensorbeeio/waypoint:latest
     depends_on:
       db:
         condition: service_healthy
@@ -95,12 +95,12 @@ Override the entrypoint to use the CLI directly:
 
 ```bash
 # Show help
-docker run --rm --entrypoint waypoint tensorbee/waypoint --help
+docker run --rm --entrypoint waypoint tensorbeeio/waypoint --help
 
 # Migration status
 docker run --rm --entrypoint waypoint \
   -v ./db/migrations:/waypoint/sql \
-  tensorbee/waypoint \
+  tensorbeeio/waypoint \
   --url "postgres://user:pass@host:5432/mydb" \
   --locations /waypoint/sql \
   info
@@ -108,7 +108,7 @@ docker run --rm --entrypoint waypoint \
 # Dry-run
 docker run --rm --entrypoint waypoint \
   -v ./db/migrations:/waypoint/sql \
-  tensorbee/waypoint \
+  tensorbeeio/waypoint \
   --url "postgres://user:pass@host:5432/mydb" \
   --locations /waypoint/sql \
   --dry-run migrate
@@ -116,7 +116,7 @@ docker run --rm --entrypoint waypoint \
 # JSON output
 docker run --rm --entrypoint waypoint \
   -v ./db/migrations:/waypoint/sql \
-  tensorbee/waypoint \
+  tensorbeeio/waypoint \
   --url "postgres://user:pass@host:5432/mydb" \
   --locations /waypoint/sql \
   --json info
@@ -124,7 +124,7 @@ docker run --rm --entrypoint waypoint \
 # Validate / Repair
 docker run --rm --entrypoint waypoint \
   -v ./db/migrations:/waypoint/sql \
-  tensorbee/waypoint \
+  tensorbeeio/waypoint \
   --url "postgres://user:pass@host:5432/mydb" \
   --locations /waypoint/sql \
   validate
@@ -142,7 +142,7 @@ docker run --rm \
   -e DB_USERNAME=admin \
   -e DB_PASSWORD=secret \
   -e SSL_MODE=require \
-  tensorbee/waypoint
+  tensorbeeio/waypoint
 ```
 
 ## Exit Codes

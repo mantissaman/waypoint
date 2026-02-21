@@ -4,8 +4,8 @@
 [![crates.io](https://img.shields.io/crates/v/waypoint-core.svg)](https://crates.io/crates/waypoint-core)
 [![docs.rs](https://docs.rs/waypoint-core/badge.svg)](https://docs.rs/waypoint-core)
 [![Downloads](https://img.shields.io/crates/d/waypoint-core.svg)](https://crates.io/crates/waypoint-core)
-[![Docker Hub](https://img.shields.io/docker/v/tensorbee/waypoint?label=docker&sort=semver)](https://hub.docker.com/r/tensorbee/waypoint)
-[![Docker Pulls](https://img.shields.io/docker/pulls/tensorbee/waypoint)](https://hub.docker.com/r/tensorbee/waypoint)
+[![Docker Hub](https://img.shields.io/docker/v/tensorbeeio/waypoint?label=docker&sort=semver)](https://hub.docker.com/r/tensorbeeio/waypoint)
+[![Docker Pulls](https://img.shields.io/docker/pulls/tensorbeeio/waypoint)](https://hub.docker.com/r/tensorbeeio/waypoint)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Lightweight, Flyway-compatible PostgreSQL migration tool built in Rust.
@@ -110,7 +110,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ### Docker
 
 ```bash
-docker pull tensorbee/waypoint:latest
+docker pull tensorbeeio/waypoint:latest
 ```
 
 ## Quick Start
@@ -665,7 +665,7 @@ docker run --rm \
   -e DB_NAME=mydb \
   -e DB_USERNAME=postgres \
   -e DB_PASSWORD=secret \
-  tensorbee/waypoint
+  tensorbeeio/waypoint
 ```
 
 ### Docker Compose
@@ -685,7 +685,7 @@ services:
       retries: 5
 
   migrate:
-    image: tensorbee/waypoint:latest
+    image: tensorbeeio/waypoint:latest
     depends_on:
       db:
         condition: service_healthy
@@ -706,7 +706,7 @@ FROM flyway/flyway
 COPY migrations /flyway/sql
 
 # After
-FROM tensorbee/waypoint
+FROM tensorbeeio/waypoint
 COPY migrations /waypoint/sql
 ```
 
