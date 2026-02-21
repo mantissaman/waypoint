@@ -1,10 +1,10 @@
 #!/bin/sh
 # Waypoint installer
-# Usage: curl -sSf https://raw.githubusercontent.com/mantissaman/waypoint/main/install.sh | sh
+# Usage: curl -sSf https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh | sh
 
 set -e
 
-REPO="mantissaman/waypoint"
+REPO="tensorbee/waypoint"
 BINARY="waypoint"
 INSTALL_DIR="/usr/local/bin"
 

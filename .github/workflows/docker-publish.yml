@@ -7,7 +7,7 @@ on:
 
 env:
   REGISTRY: docker.io
-  IMAGE_NAME: mantissaman/waypoint
+  IMAGE_NAME: tensorbee/waypoint
 
 jobs:
   build-and-push:

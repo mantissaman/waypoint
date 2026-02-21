@@ -1,11 +1,11 @@
 # Waypoint
 
-[![CI](https://github.com/mantissaman/waypoint/actions/workflows/ci.yml/badge.svg)](https://github.com/mantissaman/waypoint/actions/workflows/ci.yml)
+[![CI](https://github.com/tensorbee/waypoint/actions/workflows/ci.yml/badge.svg)](https://github.com/tensorbee/waypoint/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/waypoint-core.svg)](https://crates.io/crates/waypoint-core)
 [![docs.rs](https://docs.rs/waypoint-core/badge.svg)](https://docs.rs/waypoint-core)
 [![Downloads](https://img.shields.io/crates/d/waypoint-core.svg)](https://crates.io/crates/waypoint-core)
-[![Docker Hub](https://img.shields.io/docker/v/mantissaman/waypoint?label=docker&sort=semver)](https://hub.docker.com/r/mantissaman/waypoint)
-[![Docker Pulls](https://img.shields.io/docker/pulls/mantissaman/waypoint)](https://hub.docker.com/r/mantissaman/waypoint)
+[![Docker Hub](https://img.shields.io/docker/v/tensorbee/waypoint?label=docker&sort=semver)](https://hub.docker.com/r/tensorbee/waypoint)
+[![Docker Pulls](https://img.shields.io/docker/pulls/tensorbee/waypoint)](https://hub.docker.com/r/tensorbee/waypoint)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Lightweight, Flyway-compatible PostgreSQL migration tool built in Rust.
@@ -71,13 +71,13 @@ Waypoint is a Flyway-compatible alternative that includes many features Flyway r
 ### Quick install (Linux / macOS)
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/mantissaman/waypoint/main/install.sh | sh
+curl -sSf https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh | sh
 ```
 
 Pin a specific version:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/mantissaman/waypoint/main/install.sh | WAYPOINT_VERSION=v0.3.2 sh
+curl -sSf https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh | WAYPOINT_VERSION=v0.3.2 sh
 ```
 
 ### Self-update
@@ -110,7 +110,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ### Docker
 
 ```bash
-docker pull mantissaman/waypoint:latest
+docker pull tensorbee/waypoint:latest
 ```
 
 ## Quick Start
@@ -665,7 +665,7 @@ docker run --rm \
   -e DB_NAME=mydb \
   -e DB_USERNAME=postgres \
   -e DB_PASSWORD=secret \
-  mantissaman/waypoint
+  tensorbee/waypoint
 ```
 
 ### Docker Compose
@@ -685,7 +685,7 @@ services:
       retries: 5
 
   migrate:
-    image: mantissaman/waypoint:latest
+    image: tensorbee/waypoint:latest
     depends_on:
       db:
         condition: service_healthy
@@ -706,7 +706,7 @@ FROM flyway/flyway
 COPY migrations /flyway/sql
 
 # After
-FROM mantissaman/waypoint
+FROM tensorbee/waypoint
 COPY migrations /waypoint/sql
 ```
 
@@ -996,7 +996,7 @@ waypoint/
 
 MIT License
 
-Copyright (c) 2025 mantissaman
+Copyright (c) 2025 tensorbee
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

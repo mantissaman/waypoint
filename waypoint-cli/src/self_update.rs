@@ -13,9 +13,9 @@ use semver::Version;
 use tar::Archive;
 use waypoint_core::error::WaypointError;
 
-const REPO: &str = "mantissaman/waypoint";
+const REPO: &str = "tensorbee/waypoint";
 const INSTALL_SH_URL: &str =
-    "https://raw.githubusercontent.com/mantissaman/waypoint/main/install.sh";
+    "https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh";
 
 /// Minimal representation of a GitHub release for version checking.
 #[derive(serde::Deserialize)]
