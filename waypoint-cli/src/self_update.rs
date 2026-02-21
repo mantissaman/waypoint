@@ -14,8 +14,7 @@ use tar::Archive;
 use waypoint_core::error::WaypointError;
 
 const REPO: &str = "tensorbee/waypoint";
-const INSTALL_SH_URL: &str =
-    "https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh";
+const INSTALL_SH_URL: &str = "https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh";
 
 /// Minimal representation of a GitHub release for version checking.
 #[derive(serde::Deserialize)]
