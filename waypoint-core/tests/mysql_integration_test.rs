@@ -328,3 +328,84 @@ async fn schema_public_falls_back_to_current_database() {
     assert_eq!(r.migrations_applied, 1);
     drop_database(&name).await;
 }
+
+#[tokio::test]
+async fn clean_drops_all_objects_in_database() {
+    let name = fresh_database("clean").await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[
+            (
+                "V1__Tables.sql",
+                "CREATE TABLE a (id INT PRIMARY KEY); CREATE TABLE b (id INT PRIMARY KEY);",
+            ),
+            (
+                "V2__View.sql",
+                "CREATE OR REPLACE VIEW v AS SELECT id FROM a;",
+            ),
+        ],
+    );
+    let mut config = config_for(&name, migrations);
+    config.migrations.clean_enabled = true;
+    let wp = Waypoint::new(config).await.expect("connect");
+    wp.migrate(None).await.expect("migrate");
+
+    // Verify objects exist
+    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let mut conn = pool.get_conn().await.unwrap();
+    let before: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
+            (name.as_str(),),
+        )
+        .await
+        .unwrap();
+    assert!(before.contains(&"a".to_string()));
+    assert!(before.contains(&"b".to_string()));
+    drop(conn);
+    pool.disconnect().await.ok();
+
+    // Clean
+    let dropped = wp.clean(true).await.expect("clean");
+    assert!(dropped.iter().any(|d| d.contains("a")));
+    assert!(dropped.iter().any(|d| d.contains("b")));
+    assert!(dropped.iter().any(|d| d.contains("v")));
+
+    // Verify everything's gone
+    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let mut conn = pool.get_conn().await.unwrap();
+    let after: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?",
+            (name.as_str(),),
+        )
+        .await
+        .unwrap();
+    assert!(after.is_empty(), "expected no objects left, got: {:?}", after);
+    drop(conn);
+    pool.disconnect().await.ok();
+
+    drop_database(&name).await;
+}
+
+#[tokio::test]
+async fn clean_refuses_when_disabled_unless_force() {
+    let name = fresh_database("cleandis").await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(&migrations, &[]);
+    let mut config = config_for(&name, migrations);
+    config.migrations.clean_enabled = false;
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    // allow_clean=false + clean_enabled=false → CleanDisabled
+    let err = wp.clean(false).await.expect_err("should refuse");
+    assert!(err.to_string().to_lowercase().contains("clean"));
+
+    // allow_clean=true overrides
+    let _ = wp.clean(true).await.expect("clean with allow");
+    drop_database(&name).await;
+}

@@ -194,7 +194,7 @@ impl Waypoint {
 
     /// Drop all objects in managed schemas.
     pub async fn clean(&self, allow_clean: bool) -> Result<Vec<String>> {
-        commands::clean::execute(self.client.as_postgres()?, &self.config, allow_clean).await
+        commands::clean::execute_db(&self.client, &self.config, allow_clean).await
     }
 
     /// Run lint on migration files (no DB required).
