@@ -1,17 +1,21 @@
 //! Baseline an existing database at a specific version.
 
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;
+#[cfg(feature = "postgres")]
 use crate::db;
+use crate::db::DbClient;
 use crate::error::{Result, WaypointError};
 use crate::history;
 
-/// Execute the baseline command.
+/// Execute the baseline command (PostgreSQL legacy entry).
 ///
 /// 1. Fail if history table already has entries
 /// 2. Create history table
 /// 3. Insert a single baseline row
+#[cfg(feature = "postgres")]
 pub async fn execute(
     client: &Client,
     config: &WaypointConfig,
@@ -20,12 +24,10 @@ pub async fn execute(
 ) -> Result<()> {
     let table = &config.migrations.table;
 
-    // Acquire advisory lock to prevent concurrent operations
     db::acquire_advisory_lock(client, table).await?;
 
-    let result = execute_inner(client, config, baseline_version, baseline_description).await;
+    let result = execute_inner_pg(client, config, baseline_version, baseline_description).await;
 
-    // Always release the lock
     if let Err(e) = db::release_advisory_lock(client, table).await {
         log::error!("Failed to release advisory lock: {}", e);
     }
@@ -33,7 +35,8 @@ pub async fn execute(
     result
 }
 
-async fn execute_inner(
+#[cfg(feature = "postgres")]
+async fn execute_inner_pg(
     client: &Client,
     config: &WaypointConfig,
     baseline_version: Option<&str>,
@@ -44,15 +47,12 @@ async fn execute_inner(
     let version = baseline_version.unwrap_or(&config.migrations.baseline_version);
     let description = baseline_description.unwrap_or("<< Waypoint Baseline >>");
 
-    // Create history table if not exists
     history::create_history_table(client, schema, table).await?;
 
-    // Check if history table already has entries
     if history::has_entries(client, schema, table).await? {
         return Err(WaypointError::BaselineExists);
     }
 
-    // Insert baseline row
     let installed_by = config
         .migrations
         .installed_by
@@ -62,6 +62,72 @@ async fn execute_inner(
     history::insert_applied_migration(
         client,
         schema,
+        table,
+        Some(version),
+        description,
+        "BASELINE",
+        "<< Waypoint Baseline >>",
+        None,
+        installed_by,
+        0,
+        true,
+    )
+    .await?;
+
+    log::info!(
+        "Successfully baselined schema; version={}, schema={}",
+        version,
+        schema
+    );
+    Ok(())
+}
+
+/// Execute the baseline command (dialect-aware entry).
+pub async fn execute_db(
+    client: &DbClient,
+    config: &WaypointConfig,
+    baseline_version: Option<&str>,
+    baseline_description: Option<&str>,
+) -> Result<()> {
+    let table = &config.migrations.table;
+
+    client.acquire_lock(table).await?;
+
+    let result = execute_inner_db(client, config, baseline_version, baseline_description).await;
+
+    if let Err(e) = client.release_lock(table).await {
+        log::error!("Failed to release advisory lock: {}", e);
+    }
+
+    result
+}
+
+async fn execute_inner_db(
+    client: &DbClient,
+    config: &WaypointConfig,
+    baseline_version: Option<&str>,
+    baseline_description: Option<&str>,
+) -> Result<()> {
+    let schema = client.resolve_schema(&config.migrations.schema).await?;
+    let table = &config.migrations.table;
+    let version = baseline_version.unwrap_or(&config.migrations.baseline_version);
+    let description = baseline_description.unwrap_or("<< Waypoint Baseline >>");
+
+    history::create_history_table_db(client, &schema, table).await?;
+
+    if history::has_entries_db(client, &schema, table).await? {
+        return Err(WaypointError::BaselineExists);
+    }
+
+    let installed_by = config
+        .migrations
+        .installed_by
+        .as_deref()
+        .unwrap_or("waypoint");
+
+    history::insert_applied_migration_db(
+        client,
+        &schema,
         table,
         Some(version),
         description,

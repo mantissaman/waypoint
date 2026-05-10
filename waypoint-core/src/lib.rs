@@ -169,28 +169,22 @@ impl Waypoint {
 
     /// Show migration status information.
     pub async fn info(&self) -> Result<Vec<MigrationInfo>> {
-        commands::info::execute(self.client.as_postgres()?, &self.config).await
+        commands::info::execute_db(&self.client, &self.config).await
     }
 
     /// Validate applied migrations against local files.
     pub async fn validate(&self) -> Result<ValidateReport> {
-        commands::validate::execute(self.client.as_postgres()?, &self.config).await
+        commands::validate::execute_db(&self.client, &self.config).await
     }
 
     /// Repair the schema history table.
     pub async fn repair(&self) -> Result<RepairReport> {
-        commands::repair::execute(self.client.as_postgres()?, &self.config).await
+        commands::repair::execute_db(&self.client, &self.config).await
     }
 
     /// Baseline an existing database.
     pub async fn baseline(&self, version: Option<&str>, description: Option<&str>) -> Result<()> {
-        commands::baseline::execute(
-            self.client.as_postgres()?,
-            &self.config,
-            version,
-            description,
-        )
-        .await
+        commands::baseline::execute_db(&self.client, &self.config, version, description).await
     }
 
     /// Undo applied migrations.

@@ -212,6 +212,105 @@ async fn migrate_records_failure_when_sql_is_invalid() {
 }
 
 #[tokio::test]
+async fn info_lists_pending_and_applied_states() {
+    use waypoint_core::commands::info::MigrationState;
+    let name = fresh_database("info").await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[
+            ("V1__Done.sql", "CREATE TABLE done (id INT PRIMARY KEY);"),
+            (
+                "V2__Pending.sql",
+                "CREATE TABLE pending (id INT PRIMARY KEY);",
+            ),
+        ],
+    );
+    let config = config_for(&name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    // Apply only up to V1
+    let applied = wp.migrate(Some("1")).await.expect("migrate to V1");
+    assert_eq!(applied.migrations_applied, 1);
+
+    let infos = wp.info().await.expect("info");
+    let by_version: std::collections::HashMap<_, _> = infos
+        .iter()
+        .map(|i| (i.version.clone().unwrap(), i))
+        .collect();
+    assert_eq!(by_version["1"].state, MigrationState::Applied);
+    assert_eq!(by_version["2"].state, MigrationState::Pending);
+
+    drop_database(&name).await;
+}
+
+#[tokio::test]
+async fn validate_passes_after_migrate() {
+    let name = fresh_database("validate").await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[("V1__T.sql", "CREATE TABLE t (id INT PRIMARY KEY);")],
+    );
+    let config = config_for(&name, migrations.clone());
+    let wp = Waypoint::new(config).await.expect("connect");
+    wp.migrate(None).await.expect("migrate");
+
+    let report = wp.validate().await.expect("validate");
+    assert!(report.valid);
+    assert!(report.issues.is_empty());
+
+    // Now corrupt: modify the file but leave history checksum stale → validate should fail
+    std::fs::write(
+        migrations.join("V1__T.sql"),
+        "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(50));",
+    )
+    .unwrap();
+    let err = wp.validate().await.expect_err("should fail validation");
+    assert!(err.to_string().contains("Checksum mismatch"));
+
+    // Repair should normalise the recorded checksum to match the file
+    let repair = wp.repair().await.expect("repair");
+    assert_eq!(repair.checksums_updated, 1);
+
+    let report2 = wp.validate().await.expect("validate after repair");
+    assert!(report2.valid);
+
+    drop_database(&name).await;
+}
+
+#[tokio::test]
+async fn baseline_records_a_baseline_row() {
+    let name = fresh_database("baseline").await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(&migrations, &[]);
+    let config = config_for(&name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    wp.baseline(Some("5"), Some("imported existing"))
+        .await
+        .expect("baseline");
+
+    // A second baseline must fail because history is no longer empty
+    let err = wp
+        .baseline(Some("5"), Some("again"))
+        .await
+        .expect_err("second baseline");
+    assert!(err.to_string().contains("Baseline already exists"));
+
+    // Info should show the baseline row
+    let infos = wp.info().await.expect("info");
+    assert_eq!(infos.len(), 1);
+    assert_eq!(infos[0].version.as_deref(), Some("5"));
+    assert_eq!(infos[0].migration_type, "BASELINE");
+
+    drop_database(&name).await;
+}
+
+#[tokio::test]
 async fn schema_public_falls_back_to_current_database() {
     // When config.schema is the PG default "public", MySQL paths should fall
     // back to the connection's current database so a PG-shaped config works.
