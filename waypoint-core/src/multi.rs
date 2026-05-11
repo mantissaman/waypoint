@@ -182,6 +182,20 @@ impl MultiWaypoint {
         target_version: Option<&str>,
         fail_fast: bool,
     ) -> Result<MultiResult> {
+        Self::migrate_with_options(databases, clients, order, target_version, fail_fast, false)
+            .await
+    }
+
+    /// Run migrate on all databases in dependency order with the `force`
+    /// flag for overriding DANGER safety verdicts on PostgreSQL.
+    pub async fn migrate_with_options(
+        databases: &[NamedDatabaseConfig],
+        clients: &HashMap<String, DbClient>,
+        order: &[String],
+        target_version: Option<&str>,
+        fail_fast: bool,
+        force: bool,
+    ) -> Result<MultiResult> {
         let mut results = Vec::new();
 
         for name in order {
@@ -191,7 +205,7 @@ impl MultiWaypoint {
             match (db, client) {
                 (Some(db), Some(client)) => {
                     let config = db.to_waypoint_config();
-                    let outcome = dispatch_migrate(client, &config, target_version).await;
+                    let outcome = dispatch_migrate(client, &config, target_version, force).await;
                     match outcome {
                         Ok(report) => {
                             results.push(DatabaseResult {
@@ -300,11 +314,18 @@ async fn dispatch_migrate(
     client: &DbClient,
     config: &WaypointConfig,
     target_version: Option<&str>,
+    force: bool,
 ) -> Result<crate::commands::migrate::MigrateReport> {
     match client.dialect_kind() {
         #[cfg(feature = "postgres")]
         DialectKind::Postgres => {
-            crate::commands::migrate::execute(client.as_postgres()?, config, target_version).await
+            crate::commands::migrate::execute_with_options(
+                client.as_postgres()?,
+                config,
+                target_version,
+                force,
+            )
+            .await
         }
         #[cfg(not(feature = "postgres"))]
         DialectKind::Postgres => Err(WaypointError::ConfigError(
@@ -312,7 +333,13 @@ async fn dispatch_migrate(
         )),
         #[cfg(feature = "mysql")]
         DialectKind::Mysql => {
-            crate::commands::migrate::execute_mysql(client, config, target_version).await
+            crate::commands::migrate::execute_mysql_with_options(
+                client,
+                config,
+                target_version,
+                force,
+            )
+            .await
         }
         #[cfg(not(feature = "mysql"))]
         DialectKind::Mysql => Err(WaypointError::ConfigError(

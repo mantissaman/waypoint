@@ -533,12 +533,13 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
 
         match &cli.command {
             Commands::Migrate { target } => {
-                let result = waypoint_core::MultiWaypoint::migrate(
+                let result = waypoint_core::MultiWaypoint::migrate_with_options(
                     databases,
                     &clients,
                     &order,
                     target.as_deref(),
                     cli.fail_fast,
+                    force,
                 )
                 .await?;
                 print_report!(result, json_output, output::print_multi_result);
