@@ -787,12 +787,9 @@ async fn run_single_db_command(
         }
         Commands::Safety { file } => {
             if let Some(path) = file {
-                let report = waypoint_core::commands::safety::execute_file(
-                    wp.postgres_client()?,
-                    &wp.config,
-                    path,
-                )
-                .await?;
+                let report =
+                    waypoint_core::commands::safety::execute_file_db(wp.client(), &wp.config, path)
+                        .await?;
                 print_report!(report, json_output, output::print_safety_report);
             } else {
                 let report = wp.safety().await?;

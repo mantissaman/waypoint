@@ -1,12 +1,16 @@
 //! Schema advisor: proactive suggestions for schema improvements.
 //!
 //! Analyzes the live database schema and produces actionable advisories
-//! with generated fix SQL.
+//! with generated fix SQL. Rule IDs are namespaced per engine: `A001`-`A010`
+//! are PostgreSQL rules, `M001`-`M005` are MySQL rules.
 
 use serde::Serialize;
+
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
-use crate::db::quote_ident;
+use crate::db::{quote_ident, DbClient};
+use crate::dialect::DialectKind;
 use crate::error::Result;
 
 /// Configuration for the schema advisor.
@@ -69,7 +73,30 @@ pub struct AdvisorReport {
     pub info_count: usize,
 }
 
-/// Run all advisory rules against the database schema.
+/// Run all advisory rules against the database schema (dialect-aware entry).
+pub async fn analyze_db(
+    client: &DbClient,
+    schema: &str,
+    config: &AdvisorConfig,
+) -> Result<AdvisorReport> {
+    match client.dialect_kind() {
+        #[cfg(feature = "postgres")]
+        DialectKind::Postgres => analyze(client.as_postgres()?, schema, config).await,
+        #[cfg(not(feature = "postgres"))]
+        DialectKind::Postgres => Err(crate::error::WaypointError::ConfigError(
+            "PostgreSQL support is not compiled in".into(),
+        )),
+        #[cfg(feature = "mysql")]
+        DialectKind::Mysql => analyze_mysql(client, schema, config).await,
+        #[cfg(not(feature = "mysql"))]
+        DialectKind::Mysql => Err(crate::error::WaypointError::ConfigError(
+            "MySQL support is not compiled in".into(),
+        )),
+    }
+}
+
+/// Run all advisory rules against the database schema (PostgreSQL legacy entry).
+#[cfg(feature = "postgres")]
 pub async fn analyze(
     client: &Client,
     schema: &str,
@@ -149,6 +176,7 @@ pub fn generate_fix_sql(report: &AdvisorReport) -> String {
 
 // ── A001: Foreign key column missing index ──
 
+#[cfg(feature = "postgres")]
 async fn check_a001_fk_without_index(client: &Client, schema: &str) -> Result<Vec<Advisory>> {
     let sql = r#"
         SELECT
@@ -198,6 +226,7 @@ async fn check_a001_fk_without_index(client: &Client, schema: &str) -> Result<Ve
 
 // ── A002: Unused indexes ──
 
+#[cfg(feature = "postgres")]
 async fn check_a002_unused_indexes(client: &Client, schema: &str) -> Result<Vec<Advisory>> {
     let sql = r#"
         SELECT
@@ -236,6 +265,7 @@ async fn check_a002_unused_indexes(client: &Client, schema: &str) -> Result<Vec<
 
 // ── A003: TIMESTAMP without timezone ──
 
+#[cfg(feature = "postgres")]
 async fn check_a003_timestamp_without_tz(client: &Client, schema: &str) -> Result<Vec<Advisory>> {
     let sql = r#"
         SELECT table_name, column_name
@@ -272,6 +302,7 @@ async fn check_a003_timestamp_without_tz(client: &Client, schema: &str) -> Resul
 
 // ── A004: Table without primary key ──
 
+#[cfg(feature = "postgres")]
 async fn check_a004_table_without_pk(client: &Client, schema: &str) -> Result<Vec<Advisory>> {
     let sql = r#"
         SELECT t.table_name
@@ -309,6 +340,7 @@ async fn check_a004_table_without_pk(client: &Client, schema: &str) -> Result<Ve
 
 // ── A005: Nullable column where all values are non-null ──
 
+#[cfg(feature = "postgres")]
 async fn check_a005_nullable_all_nonnull(client: &Client, schema: &str) -> Result<Vec<Advisory>> {
     // Only check tables with at least 100 rows to avoid false positives on empty tables
     let sql = r#"
@@ -363,6 +395,7 @@ async fn check_a005_nullable_all_nonnull(client: &Client, schema: &str) -> Resul
 
 // ── A006: VARCHAR without length limit ──
 
+#[cfg(feature = "postgres")]
 async fn check_a006_varchar_without_limit(client: &Client, schema: &str) -> Result<Vec<Advisory>> {
     let sql = r#"
         SELECT table_name, column_name
@@ -396,6 +429,7 @@ async fn check_a006_varchar_without_limit(client: &Client, schema: &str) -> Resu
 
 // ── A007: Duplicate indexes ──
 
+#[cfg(feature = "postgres")]
 async fn check_a007_duplicate_indexes(client: &Client, schema: &str) -> Result<Vec<Advisory>> {
     let sql = r#"
         SELECT
@@ -436,6 +470,7 @@ async fn check_a007_duplicate_indexes(client: &Client, schema: &str) -> Result<V
 
 // ── A008: Sequential scan on large table ──
 
+#[cfg(feature = "postgres")]
 async fn check_a008_seq_scan_large_table(client: &Client, schema: &str) -> Result<Vec<Advisory>> {
     let sql = r#"
         SELECT
@@ -474,6 +509,7 @@ async fn check_a008_seq_scan_large_table(client: &Client, schema: &str) -> Resul
 
 // ── A009: Enum with >20 values ──
 
+#[cfg(feature = "postgres")]
 async fn check_a009_large_enum(client: &Client, schema: &str) -> Result<Vec<Advisory>> {
     let sql = r#"
         SELECT t.typname, count(e.enumlabel)::int AS label_count
@@ -509,6 +545,7 @@ async fn check_a009_large_enum(client: &Client, schema: &str) -> Result<Vec<Advi
 
 // ── A010: Orphaned sequences ──
 
+#[cfg(feature = "postgres")]
 async fn check_a010_orphaned_sequences(client: &Client, schema: &str) -> Result<Vec<Advisory>> {
     let sql = r#"
         SELECT s.relname
@@ -540,6 +577,277 @@ async fn check_a010_orphaned_sequences(client: &Client, schema: &str) -> Result<
                 ),
                 fix_sql: Some(format!("DROP SEQUENCE IF EXISTS {};", quote_ident(&name))),
             }
+        })
+        .collect())
+}
+
+// ── MySQL rules ─────────────────────────────────────────────────────────────
+//
+// Rule numbering is namespaced: A001-A010 are PostgreSQL rules above, M001-M005
+// are MySQL rules below. They share the same Advisory / AdvisorReport types so
+// JSON consumers can ignore the dialect.
+
+/// Run all advisory rules against a MySQL schema.
+///
+/// Current rule set:
+/// - M001: foreign key column without an index (analog of A001)
+/// - M002: table without a primary key (analog of A004)
+/// - M003: non-utf8mb4 charset in use (MySQL-specific)
+/// - M004: non-InnoDB storage engine (MyISAM etc.) — risky for transactions
+/// - M005: duplicate indexes on the same columns (analog of A007)
+#[cfg(feature = "mysql")]
+pub async fn analyze_mysql(
+    client: &DbClient,
+    schema: &str,
+    config: &AdvisorConfig,
+) -> Result<AdvisorReport> {
+    let mut advisories = Vec::new();
+    if !config.disabled_rules.contains(&"M001".to_string()) {
+        advisories.extend(check_m001_fk_without_index_mysql(client, schema).await?);
+    }
+    if !config.disabled_rules.contains(&"M002".to_string()) {
+        advisories.extend(check_m002_table_without_pk_mysql(client, schema).await?);
+    }
+    if !config.disabled_rules.contains(&"M003".to_string()) {
+        advisories.extend(check_m003_non_utf8mb4_charset(client, schema).await?);
+    }
+    if !config.disabled_rules.contains(&"M004".to_string()) {
+        advisories.extend(check_m004_non_innodb_engine(client, schema).await?);
+    }
+    if !config.disabled_rules.contains(&"M005".to_string()) {
+        advisories.extend(check_m005_duplicate_indexes_mysql(client, schema).await?);
+    }
+
+    let warning_count = advisories
+        .iter()
+        .filter(|a| a.severity == AdvisorySeverity::Warning)
+        .count();
+    let suggestion_count = advisories
+        .iter()
+        .filter(|a| a.severity == AdvisorySeverity::Suggestion)
+        .count();
+    let info_count = advisories
+        .iter()
+        .filter(|a| a.severity == AdvisorySeverity::Info)
+        .count();
+
+    Ok(AdvisorReport {
+        schema: schema.to_string(),
+        advisories,
+        warning_count,
+        suggestion_count,
+        info_count,
+    })
+}
+
+// ── M001: Foreign key column missing index ──
+#[cfg(feature = "mysql")]
+async fn check_m001_fk_without_index_mysql(
+    client: &DbClient,
+    schema: &str,
+) -> Result<Vec<Advisory>> {
+    use mysql_async::prelude::*;
+    let pool = client.as_mysql()?;
+    let mut conn = pool.get_conn().await?;
+    // Foreign keys whose first column has no covering index. We approximate
+    // by joining KEY_COLUMN_USAGE (FK columns) against STATISTICS (indexed
+    // columns), filtering FKs whose column doesn't appear as the FIRST column
+    // of any index. MySQL automatically creates an index on FK columns at FK
+    // creation time — but a later DROP INDEX can leave the FK without one.
+    let rows: Vec<(String, String, String)> = conn
+        .exec(
+            "SELECT kcu.TABLE_NAME, kcu.COLUMN_NAME, kcu.CONSTRAINT_NAME \
+             FROM information_schema.KEY_COLUMN_USAGE kcu \
+             WHERE kcu.TABLE_SCHEMA = ? \
+               AND kcu.REFERENCED_TABLE_NAME IS NOT NULL \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM information_schema.STATISTICS s \
+                 WHERE s.TABLE_SCHEMA = kcu.TABLE_SCHEMA \
+                   AND s.TABLE_NAME = kcu.TABLE_NAME \
+                   AND s.COLUMN_NAME = kcu.COLUMN_NAME \
+                   AND s.SEQ_IN_INDEX = 1 \
+               ) \
+             ORDER BY kcu.TABLE_NAME, kcu.COLUMN_NAME",
+            (schema,),
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(table, column, _constraint)| Advisory {
+            rule_id: "M001".to_string(),
+            category: "Performance".to_string(),
+            severity: AdvisorySeverity::Warning,
+            object: format!("{}.{}", table, column),
+            explanation: format!(
+                "Foreign key column {}.{} has no covering index — joins and FK \
+                 constraint checks will perform a full table scan",
+                table, column
+            ),
+            fix_sql: Some(format!(
+                "CREATE INDEX `idx_{table}_{column}` ON `{table}` (`{column}`);"
+            )),
+        })
+        .collect())
+}
+
+// ── M002: Table without primary key ──
+#[cfg(feature = "mysql")]
+async fn check_m002_table_without_pk_mysql(
+    client: &DbClient,
+    schema: &str,
+) -> Result<Vec<Advisory>> {
+    use mysql_async::prelude::*;
+    let pool = client.as_mysql()?;
+    let mut conn = pool.get_conn().await?;
+    let rows: Vec<String> = conn
+        .exec(
+            "SELECT t.TABLE_NAME FROM information_schema.TABLES t \
+             WHERE t.TABLE_SCHEMA = ? AND t.TABLE_TYPE = 'BASE TABLE' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM information_schema.TABLE_CONSTRAINTS tc \
+                 WHERE tc.TABLE_SCHEMA = t.TABLE_SCHEMA \
+                   AND tc.TABLE_NAME = t.TABLE_NAME \
+                   AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY' \
+               ) \
+             ORDER BY t.TABLE_NAME",
+            (schema,),
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|table| Advisory {
+            rule_id: "M002".to_string(),
+            category: "Correctness".to_string(),
+            severity: AdvisorySeverity::Warning,
+            object: table.clone(),
+            explanation: format!(
+                "Table {} has no primary key — InnoDB will create a hidden \
+                 6-byte rowid index, replication and crash recovery suffer",
+                table
+            ),
+            fix_sql: None, // can't auto-fix without knowing the right column
+        })
+        .collect())
+}
+
+// ── M003: Non-utf8mb4 charset ──
+#[cfg(feature = "mysql")]
+async fn check_m003_non_utf8mb4_charset(client: &DbClient, schema: &str) -> Result<Vec<Advisory>> {
+    use mysql_async::prelude::*;
+    let pool = client.as_mysql()?;
+    let mut conn = pool.get_conn().await?;
+    // Tables whose default charset isn't utf8mb4. utf8 (3-byte) is a frequent
+    // legacy footgun that can't store 4-byte characters (emoji, some Asian
+    // scripts) and may surface as silent data corruption.
+    let rows: Vec<(String, String)> = conn
+        .exec(
+            "SELECT t.TABLE_NAME, ccsa.CHARACTER_SET_NAME \
+             FROM information_schema.TABLES t \
+             JOIN information_schema.COLLATION_CHARACTER_SET_APPLICABILITY ccsa \
+               ON ccsa.COLLATION_NAME = t.TABLE_COLLATION \
+             WHERE t.TABLE_SCHEMA = ? AND t.TABLE_TYPE = 'BASE TABLE' \
+               AND ccsa.CHARACTER_SET_NAME <> 'utf8mb4' \
+             ORDER BY t.TABLE_NAME",
+            (schema,),
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(table, charset)| Advisory {
+            rule_id: "M003".to_string(),
+            category: "Correctness".to_string(),
+            severity: AdvisorySeverity::Suggestion,
+            object: table.clone(),
+            explanation: format!(
+                "Table {} uses charset '{}' — utf8mb4 is the modern default \
+                 and supports the full Unicode range (4-byte chars)",
+                table, charset
+            ),
+            fix_sql: Some(format!(
+                "ALTER TABLE `{table}` CONVERT TO CHARACTER SET utf8mb4 \
+                 COLLATE utf8mb4_0900_ai_ci;"
+            )),
+        })
+        .collect())
+}
+
+// ── M004: Non-InnoDB storage engine ──
+#[cfg(feature = "mysql")]
+async fn check_m004_non_innodb_engine(client: &DbClient, schema: &str) -> Result<Vec<Advisory>> {
+    use mysql_async::prelude::*;
+    let pool = client.as_mysql()?;
+    let mut conn = pool.get_conn().await?;
+    let rows: Vec<(String, String)> = conn
+        .exec(
+            "SELECT TABLE_NAME, ENGINE FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' \
+               AND ENGINE IS NOT NULL AND ENGINE <> 'InnoDB' \
+             ORDER BY TABLE_NAME",
+            (schema,),
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(table, engine)| Advisory {
+            rule_id: "M004".to_string(),
+            category: "Correctness".to_string(),
+            severity: AdvisorySeverity::Warning,
+            object: table.clone(),
+            explanation: format!(
+                "Table {} uses storage engine '{}' — InnoDB is the modern \
+                 default and the only engine with full transaction + crash-\
+                 recovery support",
+                table, engine
+            ),
+            fix_sql: Some(format!("ALTER TABLE `{table}` ENGINE = InnoDB;")),
+        })
+        .collect())
+}
+
+// ── M005: Duplicate indexes ──
+#[cfg(feature = "mysql")]
+async fn check_m005_duplicate_indexes_mysql(
+    client: &DbClient,
+    schema: &str,
+) -> Result<Vec<Advisory>> {
+    use mysql_async::prelude::*;
+    let pool = client.as_mysql()?;
+    let mut conn = pool.get_conn().await?;
+    // Indexes that index exactly the same column sequence on the same table.
+    // We group by (table, column-sequence) and emit an advisory when more
+    // than one index name appears in a group. Concatenating column names with
+    // a delimiter is a coarse fingerprint; for the same physical leaf it's
+    // sufficient.
+    let rows: Vec<(String, String, i64)> = conn
+        .exec(
+            "SELECT TABLE_NAME, GROUP_CONCAT(INDEX_NAME ORDER BY INDEX_NAME), COUNT(*) \
+             FROM ( \
+                 SELECT TABLE_NAME, INDEX_NAME, \
+                        GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS cols \
+                 FROM information_schema.STATISTICS \
+                 WHERE TABLE_SCHEMA = ? \
+                 GROUP BY TABLE_NAME, INDEX_NAME \
+             ) g \
+             GROUP BY TABLE_NAME, cols \
+             HAVING COUNT(*) > 1 \
+             ORDER BY TABLE_NAME",
+            (schema,),
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(table, names, count)| Advisory {
+            rule_id: "M005".to_string(),
+            category: "Performance".to_string(),
+            severity: AdvisorySeverity::Suggestion,
+            object: format!("{}: {}", table, names),
+            explanation: format!(
+                "Table {} has {} indexes ({}) covering the same columns — \
+                 drop the redundant ones to reduce write amplification and \
+                 storage",
+                table, count, names
+            ),
+            fix_sql: None,
         })
         .collect())
 }

@@ -261,12 +261,12 @@ impl Waypoint {
 
     /// Analyze pending migrations for safety (lock analysis, impact estimation).
     pub async fn safety(&self) -> Result<SafetyCommandReport> {
-        commands::safety::execute(self.client.as_postgres()?, &self.config).await
+        commands::safety::execute_db(&self.client, &self.config).await
     }
 
     /// Run schema advisor to suggest improvements.
     pub async fn advise(&self) -> Result<AdvisorReport> {
-        commands::advisor::execute(self.client.as_postgres()?, &self.config).await
+        commands::advisor::execute_db(&self.client, &self.config).await
     }
 
     /// Simulate pending migrations in a throwaway schema.
