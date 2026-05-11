@@ -305,7 +305,9 @@ async fn run_migrate(
         hooks_time_ms: 0,
     };
 
-    let mut sorted_versioned = pending_versioned.clone();
+    // `pending_versioned` isn't used again after this — move it in and sort
+    // in place rather than cloning the Vec<&ResolvedMigration>.
+    let mut sorted_versioned = pending_versioned;
     sorted_versioned.sort_by(|a, b| a.version().unwrap().cmp(b.version().unwrap()));
 
     let has_pending = !sorted_versioned.is_empty() || !pending_repeatables.is_empty();
