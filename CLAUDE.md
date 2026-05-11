@@ -9,7 +9,7 @@ cargo build                                              # Build both crates (de
 cargo build --features mysql                             # Build with MySQL backend
 cargo test --lib                                         # Unit tests (postgres only, 257 tests)
 cargo test --features mysql --lib                        # Unit tests with both backends (262 tests)
-cargo test --features mysql --test mysql_integration_test  # MySQL integration tests (10 tests, needs container)
+cargo test --features mysql --test mysql_integration_test  # MySQL integration tests (17 tests, needs container)
 cargo test                                               # Integration tests need TEST_DATABASE_URL (PG)
 cargo clippy --features mysql --all-targets -- -D warnings  # Lint (use --features mysql to cover both paths)
 cargo fmt --check                                        # Format check
@@ -71,17 +71,24 @@ No-DB commands (pure file analysis): `lint`, `changelog`, `check_conflicts` — 
 
 | Command | Status | Notes |
 |---|---|---|
-| `migrate` | ✅ working | Skips guards/preflight/safety/reversals; no batch-transaction (MySQL DDL auto-commits) |
+| `migrate` | ✅ working | Skips guards/safety/reversals; no batch-transaction (MySQL DDL auto-commits) |
 | `info` | ✅ working | Dialect-aware via `execute_db` |
 | `validate` | ✅ working | Checksum check; same Flyway-compat CRC32 |
 | `repair` | ✅ working | Drops failed rows; updates checksums |
 | `baseline` | ✅ working | Refuses if history table has entries |
 | `clean` | ✅ working | Disables FOREIGN_KEY_CHECKS, drops views/tables/routines/events |
+| `snapshot` | ✅ working | `SHOW CREATE TABLE` / `SHOW CREATE VIEW` based (no full schema introspection) |
+| `restore` | ✅ working | Wipes target DB, replays snapshot via MySQL-aware splitter |
+| `undo` | ✅ working | Manual U-files only — auto-reversal still PG-specific |
+| `preflight` | ✅ working | 6 MySQL-specific checks: read-only, connections, processlist, replica lag, db size, metadata locks |
+| `simulate` | ✅ working | Replicates source DDL into a temp database via SHOW CREATE, runs pendings, drops temp DB |
 | `lint` / `changelog` / `check-conflicts` | ✅ working | No-DB; engine-agnostic |
-| `undo` | ⚠️ PG only | Reversal-generation depends on schema introspection |
-| `diff` / `drift` / `snapshot` / `restore` | ⚠️ PG only | Requires MySQL schema introspection module |
-| `safety` / `advisor` / `preflight` / `simulate` | ⚠️ PG only | Each needs a parallel rule set, not a 1:1 port |
-| `explain` | ⚠️ PG only | EXPLAIN syntax differs significantly on MySQL |
+| `guards` (require / ensure) | ⚠️ PG only | guard.rs builtin functions use pg_catalog; need MySQL information_schema port |
+| `auto-reversal generation` | ⚠️ PG only | Depends on full schema diff; deferred with diff/drift |
+| `diff` / `drift` | ⚠️ PG only | Both need a MySQL schema-introspection module parallel to schema.rs |
+| `safety` | ⚠️ PG only | Lock-level mapping is PG-specific; MySQL needs ALGORITHM=INSTANT/INPLACE/COPY rules |
+| `advisor` | ⚠️ PG only | A001-A010 are PG-rule-shaped; need parallel MySQL rule set |
+| `explain` | ⚠️ PG only | EXPLAIN syntax differs on MySQL; not yet wired |
 
 ### CLI (waypoint-cli/src/)
 
