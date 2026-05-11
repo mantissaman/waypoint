@@ -4,11 +4,14 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;
+use crate::db::DbClient;
 use crate::error::Result;
-use crate::history;
+use crate::history::{self, AppliedMigration};
 use crate::migration::{scan_migrations, MigrationKind, MigrationVersion, ResolvedMigration};
 
 /// The state of a migration.
@@ -74,42 +77,62 @@ pub struct MigrationInfo {
     pub checksum: Option<i32>,
 }
 
-/// Execute the info command: merge resolved files and applied history into a unified view.
+/// Execute the info command (PostgreSQL legacy entry).
+#[cfg(feature = "postgres")]
 pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<MigrationInfo>> {
     let schema = &config.migrations.schema;
     let table = &config.migrations.table;
 
-    // Ensure history table exists
     if !history::history_table_exists(client, schema, table).await? {
-        // No history table — all resolved migrations are Pending (skip undo files)
         let resolved = scan_migrations(&config.migrations.locations)?;
-        return Ok(resolved
-            .into_iter()
-            .filter(|m| !m.is_undo())
-            .map(|m| {
-                let version = m.version().map(|v| v.raw.clone());
-                let migration_type = m.migration_type().to_string();
-                MigrationInfo {
-                    version,
-                    description: m.description,
-                    migration_type,
-                    script: m.script,
-                    state: MigrationState::Pending,
-                    installed_on: None,
-                    execution_time: None,
-                    checksum: Some(m.checksum),
-                }
-            })
-            .collect());
+        return Ok(pending_only(resolved));
     }
-
-    let resolved = scan_migrations(&config.migrations.locations)?;
     let applied = history::get_applied_migrations(client, schema, table).await?;
+    let resolved = scan_migrations(&config.migrations.locations)?;
+    Ok(merge(applied, resolved))
+}
 
-    // Compute effective applied versions (respects undo state)
+/// Execute the info command (dialect-aware entry).
+pub async fn execute_db(client: &DbClient, config: &WaypointConfig) -> Result<Vec<MigrationInfo>> {
+    let schema = client.resolve_schema(&config.migrations.schema).await?;
+    let schema = schema.as_str();
+    let table = &config.migrations.table;
+
+    if !history::history_table_exists_db(client, schema, table).await? {
+        let resolved = scan_migrations(&config.migrations.locations)?;
+        return Ok(pending_only(resolved));
+    }
+    let applied = history::get_applied_migrations_db(client, schema, table).await?;
+    let resolved = scan_migrations(&config.migrations.locations)?;
+    Ok(merge(applied, resolved))
+}
+
+/// Build the "everything is pending" view used when the history table is absent.
+fn pending_only(resolved: Vec<ResolvedMigration>) -> Vec<MigrationInfo> {
+    resolved
+        .into_iter()
+        .filter(|m| !m.is_undo())
+        .map(|m| {
+            let version = m.version().map(|v| v.raw.clone());
+            let migration_type = m.migration_type().to_string();
+            MigrationInfo {
+                version,
+                description: m.description,
+                migration_type,
+                script: m.script,
+                state: MigrationState::Pending,
+                installed_on: None,
+                execution_time: None,
+                checksum: Some(m.checksum),
+            }
+        })
+        .collect()
+}
+
+/// Merge applied-migration rows with on-disk migrations into a unified status view.
+fn merge(applied: Vec<AppliedMigration>, resolved: Vec<ResolvedMigration>) -> Vec<MigrationInfo> {
     let effective = history::effective_applied_versions(&applied);
 
-    // Build lookup maps (exclude undo files — they aren't shown as separate info rows)
     let resolved_by_version: HashMap<String, &ResolvedMigration> = resolved
         .iter()
         .filter(|m| m.is_versioned())
@@ -122,29 +145,22 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
         .map(|m| (m.script.clone(), m))
         .collect();
 
-    // Find baseline version
     let baseline_version = applied
         .iter()
         .find(|a| a.migration_type == "BASELINE")
         .and_then(|a| a.version.as_ref())
-        .map(|v| MigrationVersion::parse(v))
-        .transpose()?;
+        .and_then(|v| MigrationVersion::parse(v).ok());
 
-    // Highest effectively-applied version
     let highest_applied = effective
         .iter()
         .filter_map(|v| MigrationVersion::parse(v).ok())
         .max();
 
     let mut infos: Vec<MigrationInfo> = Vec::new();
-
-    // Process applied migrations first (to track what's in history)
     let mut seen_versions: HashMap<String, bool> = HashMap::new();
     let mut seen_scripts: HashMap<String, bool> = HashMap::new();
 
     for am in &applied {
-        // Distinguish versioned vs repeatable by presence of version (not type string),
-        // for compatibility with Flyway which stores both as type "SQL".
         let is_versioned = am.version.is_some();
         let is_repeatable = am.version.is_none() && am.migration_type != "BASELINE";
 
@@ -157,7 +173,6 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
         } else if is_versioned {
             if let Some(ref version) = am.version {
                 if !effective.contains(version) {
-                    // This forward migration was later undone
                     MigrationState::Undone
                 } else if resolved_by_version.contains_key(version) {
                     MigrationState::Applied
@@ -168,7 +183,6 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
                 MigrationState::Applied
             }
         } else if is_repeatable {
-            // Check if file still exists and if checksum changed
             if let Some(resolved) = resolved_by_script.get(&am.script) {
                 if Some(resolved.checksum) != am.checksum {
                     MigrationState::Outdated
@@ -201,7 +215,6 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
         });
     }
 
-    // Add pending resolved migrations not in history (skip undo files)
     for m in &resolved {
         if m.is_undo() {
             continue;
@@ -211,7 +224,6 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
                 if seen_versions.contains_key(&version.raw) {
                     continue;
                 }
-
                 let state = if let Some(ref bv) = baseline_version {
                     if version <= bv {
                         MigrationState::BelowBaseline
@@ -247,9 +259,8 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
             }
             MigrationKind::Repeatable => {
                 if seen_scripts.contains_key(&m.script) {
-                    continue; // Already handled above (Applied or Outdated)
+                    continue;
                 }
-
                 infos.push(MigrationInfo {
                     version: None,
                     description: m.description.clone(),
@@ -265,7 +276,6 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
         }
     }
 
-    // Sort: versioned by version, then repeatable by description
     infos.sort_by(|a, b| match (&a.version, &b.version) {
         (Some(av), Some(bv)) => {
             let pa = MigrationVersion::parse(av);
@@ -280,5 +290,5 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Vec<Mig
         (None, None) => a.description.cmp(&b.description),
     });
 
-    Ok(infos)
+    infos
 }

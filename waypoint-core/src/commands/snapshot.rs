@@ -6,10 +6,15 @@
 use std::path::PathBuf;
 
 use serde::Serialize;
+
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;
+use crate::db::DbClient;
+use crate::dialect::DialectKind;
 use crate::error::{Result, WaypointError};
+#[cfg(feature = "postgres")]
 use crate::schema;
 
 /// Configuration for snapshots.
@@ -21,6 +26,13 @@ pub struct SnapshotConfig {
     pub auto_snapshot_on_migrate: bool,
     /// Maximum number of snapshots to retain (oldest are pruned).
     pub max_snapshots: usize,
+    /// MySQL only: strip `DEFINER=...` clauses from view (and routine) DDL in
+    /// the snapshot. Defaults to `true` because the most common restore
+    /// scenario is cross-account/cross-host, where the original definer user
+    /// doesn't exist on the target. Set to `false` to preserve `DEFINER`
+    /// clauses verbatim (the restoring user then needs `SUPER` /
+    /// `SET_USER_ID` privileges).
+    pub strip_definer_mysql: bool,
 }
 
 impl Default for SnapshotConfig {
@@ -29,6 +41,7 @@ impl Default for SnapshotConfig {
             directory: PathBuf::from(".waypoint/snapshots"),
             auto_snapshot_on_migrate: false,
             max_snapshots: 10,
+            strip_definer_mysql: true,
         }
     }
 }
@@ -66,7 +79,8 @@ pub struct SnapshotInfo {
     pub created: String,
 }
 
-/// Take a snapshot of the current schema.
+/// Take a snapshot of the current schema (PostgreSQL legacy entry).
+#[cfg(feature = "postgres")]
 pub async fn execute_snapshot(
     client: &Client,
     config: &WaypointConfig,
@@ -127,7 +141,8 @@ pub async fn execute_snapshot(
     })
 }
 
-/// Restore a schema from a snapshot.
+/// Restore a schema from a snapshot (PostgreSQL legacy entry).
+#[cfg(feature = "postgres")]
 pub async fn execute_restore(
     client: &Client,
     config: &WaypointConfig,
@@ -236,6 +251,297 @@ pub fn list_snapshots(snapshot_config: &SnapshotConfig) -> Result<Vec<SnapshotIn
     Ok(snapshots)
 }
 
+/// Take a snapshot of the current schema (dialect-aware entry).
+pub async fn execute_snapshot_db(
+    client: &DbClient,
+    config: &WaypointConfig,
+    snapshot_config: &SnapshotConfig,
+) -> Result<SnapshotReport> {
+    match client.dialect_kind() {
+        #[cfg(feature = "postgres")]
+        DialectKind::Postgres => {
+            execute_snapshot(client.as_postgres()?, config, snapshot_config).await
+        }
+        #[cfg(not(feature = "postgres"))]
+        DialectKind::Postgres => Err(WaypointError::ConfigError(
+            "PostgreSQL support is not compiled in (enable the `postgres` feature)".into(),
+        )),
+        #[cfg(feature = "mysql")]
+        DialectKind::Mysql => execute_snapshot_mysql(client, config, snapshot_config).await,
+        #[cfg(not(feature = "mysql"))]
+        DialectKind::Mysql => Err(WaypointError::ConfigError(
+            "MySQL support is not compiled in (enable the `mysql` feature)".into(),
+        )),
+    }
+}
+
+/// Restore a schema from a snapshot (dialect-aware entry).
+pub async fn execute_restore_db(
+    client: &DbClient,
+    config: &WaypointConfig,
+    snapshot_config: &SnapshotConfig,
+    snapshot_id: &str,
+) -> Result<RestoreReport> {
+    match client.dialect_kind() {
+        #[cfg(feature = "postgres")]
+        DialectKind::Postgres => {
+            execute_restore(client.as_postgres()?, config, snapshot_config, snapshot_id).await
+        }
+        #[cfg(not(feature = "postgres"))]
+        DialectKind::Postgres => Err(WaypointError::ConfigError(
+            "PostgreSQL support is not compiled in (enable the `postgres` feature)".into(),
+        )),
+        #[cfg(feature = "mysql")]
+        DialectKind::Mysql => {
+            execute_restore_mysql(client, config, snapshot_config, snapshot_id).await
+        }
+        #[cfg(not(feature = "mysql"))]
+        DialectKind::Mysql => Err(WaypointError::ConfigError(
+            "MySQL support is not compiled in (enable the `mysql` feature)".into(),
+        )),
+    }
+}
+
+// ── MySQL snapshot/restore ────────────────────────────────────────────────────
+//
+// MySQL doesn't get the full schema:: introspection treatment yet. Instead we
+// use SHOW CREATE TABLE / SHOW CREATE VIEW as the canonical DDL source. This
+// captures: tables (with columns, indexes, constraints, AUTO_INCREMENT,
+// ENGINE/CHARSET clauses) and views. It deliberately skips: routines, triggers,
+// events. Add those when the underlying use cases need them.
+
+#[cfg(feature = "mysql")]
+async fn execute_snapshot_mysql(
+    client: &DbClient,
+    config: &WaypointConfig,
+    snapshot_config: &SnapshotConfig,
+) -> Result<SnapshotReport> {
+    use mysql_async::prelude::*;
+    let pool = client.as_mysql()?;
+    let schema_name = client.resolve_schema(&config.migrations.schema).await?;
+    let mut conn = pool.get_conn().await?;
+
+    let dir = &snapshot_config.directory;
+    std::fs::create_dir_all(dir)?;
+    let snapshot_id = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let sql_path = dir.join(format!("{}.sql", snapshot_id));
+    let meta_path = dir.join(format!("{}.json", snapshot_id));
+
+    // Tables (excluding views, which information_schema reports separately
+    // but SHOW FULL TABLES bundles together with a Table_type column).
+    let tables: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' \
+             ORDER BY TABLE_NAME",
+            (schema_name.as_str(),),
+        )
+        .await?;
+
+    // Views in dependency-safe alphabetical order (good enough for most cases;
+    // cyclic view dependencies aren't allowed by MySQL).
+    let views: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.VIEWS \
+             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
+            (schema_name.as_str(),),
+        )
+        .await?;
+
+    let mut ddl = String::new();
+    ddl.push_str(&format!(
+        "-- Waypoint MySQL snapshot\n-- database: {}\n-- created: {}\n\n",
+        schema_name,
+        chrono::Utc::now().to_rfc3339()
+    ));
+
+    for table_name in &tables {
+        let stmt = format!("SHOW CREATE TABLE `{}`.`{}`", schema_name, table_name);
+        let row: Option<(String, String)> = conn.query_first(&stmt).await?;
+        if let Some((_, create_sql)) = row {
+            ddl.push_str(&format!("-- Table: {}\n", table_name));
+            ddl.push_str(&create_sql);
+            ddl.push_str(";\n\n");
+        }
+    }
+
+    for view_name in &views {
+        let stmt = format!("SHOW CREATE VIEW `{}`.`{}`", schema_name, view_name);
+        // SHOW CREATE VIEW returns (View, Create View, character_set_client, collation_connection)
+        let row: Option<(String, String, String, String)> = conn.query_first(&stmt).await?;
+        if let Some((_, create_sql, _, _)) = row {
+            let create_sql = if snapshot_config.strip_definer_mysql {
+                strip_mysql_definer(&create_sql)
+            } else {
+                create_sql
+            };
+            ddl.push_str(&format!("-- View: {}\n", view_name));
+            ddl.push_str(&create_sql);
+            ddl.push_str(";\n\n");
+        }
+    }
+
+    let objects_captured = tables.len() + views.len();
+    std::fs::write(&sql_path, &ddl)?;
+    let meta = serde_json::json!({
+        "snapshot_id": snapshot_id,
+        "engine": "mysql",
+        "database": schema_name,
+        "objects_captured": objects_captured,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "tables": tables.len(),
+        "views": views.len(),
+    });
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap())?;
+    prune_snapshots(dir, snapshot_config.max_snapshots)?;
+
+    Ok(SnapshotReport {
+        snapshot_id,
+        snapshot_path: sql_path.display().to_string(),
+        objects_captured,
+    })
+}
+
+/// Strip a `DEFINER=...` clause (and an `SQL SECURITY DEFINER` clause, which
+/// inherits the missing definer's privileges) from a MySQL `SHOW CREATE VIEW`
+/// result. The clause appears between `CREATE ALGORITHM=...` and the `VIEW
+/// name` keyword, in the form `DEFINER=`user`@`host``. Stripping it makes the
+/// view restore as the current user, which is what callers want for
+/// cross-account snapshot restores.
+#[cfg(feature = "mysql")]
+fn strip_mysql_definer(create_sql: &str) -> String {
+    use std::sync::LazyLock;
+    // MySQL accepts three DEFINER forms:
+    //   1. `DEFINER=`user`@`host``       — backtick-quoted (default `SHOW
+    //      CREATE VIEW` output, including escaped doubled backticks: `aa``bb`)
+    //   2. `DEFINER='user'@'host'`       — single-quoted (less common from
+    //      `SHOW CREATE VIEW` but valid; hand-edited snapshots may use it)
+    //   3. `DEFINER=CURRENT_USER`        — unquoted function form (also
+    //      `CURRENT_USER()` with optional parens)
+    // We handle all three so a hand-edited snapshot doesn't slip through.
+    // We also strip an optional trailing `SQL SECURITY DEFINER` since after
+    // removing the definer that clause refers to a now-absent user.
+    // Case-insensitive, tolerant of extra whitespace.
+    static DEFINER_RE: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+        regex_lite::Regex::new(
+            r"(?i)\s*DEFINER\s*=\s*(?:`[^`]*`@`[^`]*`|'[^']*'@'[^']*'|CURRENT_USER(?:\s*\(\s*\))?)",
+        )
+        .unwrap()
+    });
+    static SECURITY_DEFINER_RE: LazyLock<regex_lite::Regex> =
+        LazyLock::new(|| regex_lite::Regex::new(r"(?i)\s+SQL\s+SECURITY\s+DEFINER").unwrap());
+
+    let stripped = DEFINER_RE.replace(create_sql, "");
+    SECURITY_DEFINER_RE.replace(&stripped, "").into_owned()
+}
+
+#[cfg(feature = "mysql")]
+async fn execute_restore_mysql(
+    client: &DbClient,
+    config: &WaypointConfig,
+    snapshot_config: &SnapshotConfig,
+    snapshot_id: &str,
+) -> Result<RestoreReport> {
+    use mysql_async::prelude::*;
+    let pool = client.as_mysql()?;
+    let schema_name = client.resolve_schema(&config.migrations.schema).await?;
+    let sql_path = snapshot_config
+        .directory
+        .join(format!("{}.sql", snapshot_id));
+
+    if !sql_path.exists() {
+        return Err(WaypointError::SnapshotError {
+            reason: format!(
+                "Snapshot '{}' not found at {}",
+                snapshot_id,
+                sql_path.display()
+            ),
+        });
+    }
+
+    let sql = std::fs::read_to_string(&sql_path)?;
+    let mut conn = pool.get_conn().await?;
+
+    // Make sure we're operating against the right database. Pool URL has it,
+    // but USE makes the session unambiguous and protects against connection
+    // state quirks across checkout.
+    let use_stmt = format!("USE `{}`", schema_name);
+    conn.query_drop(&use_stmt).await?;
+
+    // Wipe the database in the same destructive way PG's restore wipes the
+    // schema. We disable FK checks to make drops happen in any order.
+    conn.query_drop("SET FOREIGN_KEY_CHECKS = 0").await?;
+    // Drop views first
+    let views: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.VIEWS WHERE TABLE_SCHEMA = ?",
+            (schema_name.as_str(),),
+        )
+        .await?;
+    for v in &views {
+        let s = format!("DROP VIEW IF EXISTS `{}`.`{}`", schema_name, v);
+        conn.query_drop(&s).await?;
+    }
+    let tables: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
+            (schema_name.as_str(),),
+        )
+        .await?;
+    for t in &tables {
+        let s = format!("DROP TABLE IF EXISTS `{}`.`{}`", schema_name, t);
+        conn.query_drop(&s).await?;
+    }
+    // Keep FOREIGN_KEY_CHECKS=0 across the apply phase too: MySQL validates
+    // FK references at CREATE TABLE time (error 1822 when the referenced
+    // table doesn't exist yet), and snapshots are written in alphabetical
+    // order, not FK-dependency order. With FK checks off, MySQL records the
+    // constraint without validating that the referenced table exists yet,
+    // and forward references resolve once the referenced table is created.
+    // We restore FK checks at the end.
+
+    // Apply snapshot. The snapshot is a series of SHOW CREATE TABLE outputs,
+    // each terminated with `;`. We use a MySQL-aware splitter that respects
+    // backtick-quoted identifiers and string literals.
+    let mut objects_restored = 0;
+    for stmt in crate::sql_parser::split_mysql_statements(&sql) {
+        let trimmed = stmt.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // MySQL accepts leading `--` comments before a statement, so we don't
+        // pre-filter comment-only chunks (the chunk may carry real DDL after
+        // the comments). If the chunk is truly comments-only it executes as
+        // a no-op.
+        match conn.query_drop(trimmed).await {
+            Ok(()) => objects_restored += 1,
+            Err(e) => {
+                log::warn!(
+                    "Failed to restore statement, continuing; statement={}, error={}",
+                    &trimmed[..trimmed.len().min(80)],
+                    e
+                );
+            }
+        }
+    }
+
+    // Restore FK checks for subsequent operations on this connection. If this
+    // fails, log but don't surface — the snapshot apply already succeeded and
+    // the connection is short-lived (returns to the pool on drop).
+    if let Err(e) = conn.query_drop("SET FOREIGN_KEY_CHECKS = 1").await {
+        log::warn!(
+            "Failed to restore FOREIGN_KEY_CHECKS=1 on restore conn: {}",
+            e
+        );
+    }
+
+    Ok(RestoreReport {
+        snapshot_id: snapshot_id.to_string(),
+        objects_restored,
+    })
+}
+
 fn prune_snapshots(dir: &PathBuf, max: usize) -> Result<()> {
     let mut sql_files: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
@@ -260,4 +566,92 @@ fn prune_snapshots(dir: &PathBuf, max: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "mysql"))]
+mod tests_mysql_definer {
+    use super::strip_mysql_definer;
+
+    #[test]
+    fn strip_typical_show_create_view() {
+        let input = "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` \
+                     SQL SECURITY DEFINER VIEW `v_active_users` AS \
+                     select `u`.`id` AS `id` from `users` `u` where `u`.`active` = 1";
+        let out = strip_mysql_definer(input);
+        assert!(!out.contains("DEFINER"), "definer not stripped: {}", out);
+        assert!(
+            !out.contains("SQL SECURITY"),
+            "SQL SECURITY not stripped: {}",
+            out
+        );
+        // The view body should still be intact.
+        assert!(out.contains("VIEW `v_active_users`"));
+        assert!(out.contains("from `users`"));
+    }
+
+    #[test]
+    fn strip_view_with_at_in_host() {
+        // Host can be `%` or contain dots — the regex uses [^`]* so any
+        // non-backtick char inside the host part is fine.
+        let input = "CREATE ALGORITHM=UNDEFINED DEFINER=`app_user`@`10.0.%.%` \
+                     SQL SECURITY DEFINER VIEW `v` AS select 1";
+        let out = strip_mysql_definer(input);
+        assert!(!out.contains("DEFINER"));
+        assert!(!out.contains("SQL SECURITY"));
+    }
+
+    #[test]
+    fn strip_without_security_clause() {
+        // Older MySQL or non-default config: no SQL SECURITY clause emitted.
+        let input = "CREATE DEFINER=`root`@`localhost` VIEW `v` AS select 1";
+        let out = strip_mysql_definer(input);
+        assert!(!out.contains("DEFINER"));
+        assert_eq!(out, "CREATE VIEW `v` AS select 1");
+    }
+
+    #[test]
+    fn passthrough_when_no_definer() {
+        // SHOW CREATE TABLE output (no DEFINER clause) must be unchanged.
+        let input =
+            "CREATE TABLE `users` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB";
+        assert_eq!(strip_mysql_definer(input), input);
+    }
+
+    #[test]
+    fn strip_sql_security_invoker_preserved() {
+        // We only strip "SQL SECURITY DEFINER". "SQL SECURITY INVOKER" must be left.
+        let input = "CREATE DEFINER=`u`@`h` SQL SECURITY INVOKER VIEW `v` AS select 1";
+        let out = strip_mysql_definer(input);
+        assert!(!out.contains("DEFINER=`u`"));
+        assert!(out.contains("SQL SECURITY INVOKER"));
+    }
+
+    #[test]
+    fn strip_single_quoted_definer() {
+        // Hand-edited snapshots or tools like pt-osc may emit single-quoted
+        // user/host instead of backticks. Strip those too.
+        let input = "CREATE DEFINER='app_user'@'%' SQL SECURITY DEFINER VIEW `v` AS select 1";
+        let out = strip_mysql_definer(input);
+        assert!(!out.contains("DEFINER"));
+        assert!(!out.contains("SQL SECURITY"));
+        assert!(out.contains("VIEW `v`"));
+    }
+
+    #[test]
+    fn strip_current_user_function_form() {
+        // MySQL accepts `DEFINER=CURRENT_USER` (with or without parens) as
+        // shorthand. Defensive: strip these too.
+        let input1 = "CREATE DEFINER=CURRENT_USER VIEW `v` AS select 1";
+        assert_eq!(strip_mysql_definer(input1), "CREATE VIEW `v` AS select 1");
+        let input2 = "CREATE DEFINER=CURRENT_USER() VIEW `v` AS select 1";
+        assert_eq!(strip_mysql_definer(input2), "CREATE VIEW `v` AS select 1");
+    }
+
+    #[test]
+    fn passthrough_when_no_definer_on_table_ddl() {
+        // CREATE TABLE output never contains DEFINER. Verify strip is a no-op.
+        let input =
+            "CREATE TABLE `users` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB";
+        assert_eq!(strip_mysql_definer(input), input);
+    }
 }

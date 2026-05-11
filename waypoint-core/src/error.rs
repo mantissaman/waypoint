@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Extract the full error message from a tokio_postgres::Error,
 /// including the underlying DbError details that Display hides.
+#[cfg(feature = "postgres")]
 pub fn format_db_error(e: &tokio_postgres::Error) -> String {
     // The source chain contains the actual DbError with message/detail/hint
     if let Some(db_err) = e.as_db_error() {
@@ -40,15 +41,29 @@ pub enum WaypointError {
     #[error("Configuration error: {0}")]
     ConfigError(String),
 
-    /// A database query or connection operation failed.
+    /// A database query or connection operation failed (PostgreSQL).
+    #[cfg(feature = "postgres")]
     #[error("Database error: {}", format_db_error(.0))]
     DatabaseError(#[from] tokio_postgres::Error),
+
+    /// A database query or connection operation failed (MySQL).
+    #[cfg(feature = "mysql")]
+    #[error("Database error: {0}")]
+    MysqlError(#[from] mysql_async::Error),
 
     /// A migration filename could not be parsed into a valid migration.
     #[error("Migration parse error: {0}")]
     MigrationParseError(String),
 
-    /// The on-disk checksum of a migration does not match the recorded checksum.
+    /// **Reserved / unused.** No code path currently constructs this variant —
+    /// checksum mismatches surface as `ValidationFailed(String)` from the
+    /// `validate` command (which aggregates one or more mismatches into a
+    /// single human-readable string). Kept for back-compat with external
+    /// matchers; scheduled for removal in 0.4.0.
+    #[deprecated(
+        since = "0.3.4",
+        note = "Never produced — checksum mismatches surface as ValidationFailed. Will be removed in 0.4.0."
+    )]
     #[error("Checksum mismatch for migration {script}: expected {expected}, found {found}")]
     ChecksumMismatch {
         script: String,
@@ -114,7 +129,14 @@ pub enum WaypointError {
     #[error("Lint found {error_count} error(s): {details}")]
     LintFailed { error_count: usize, details: String },
 
-    /// A schema diff operation failed.
+    /// **Reserved / unused.** No code path currently constructs this variant —
+    /// the `diff` command surfaces failures as `ConfigError(String)` or
+    /// `DatabaseError`. Kept for back-compat with external matchers; scheduled
+    /// for removal in 0.4.0.
+    #[deprecated(
+        since = "0.3.4",
+        note = "Never produced — diff failures surface as ConfigError or DatabaseError. Will be removed in 0.4.0."
+    )]
     #[error("Diff failed: {reason}")]
     DiffFailed { reason: String },
 

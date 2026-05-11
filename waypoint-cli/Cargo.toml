@@ -2,11 +2,11 @@
 name = "waypoint-cli"
 version = "0.3.4"
 edition = "2021"
-description = "Lightweight, Flyway-compatible PostgreSQL migration CLI"
+description = "Lightweight, Flyway-compatible SQL migration CLI for PostgreSQL and MySQL"
 license = "MIT"
 repository = "https://github.com/tensorbee/waypoint"
 homepage = "https://github.com/tensorbee/waypoint"
-keywords = ["database", "migration", "postgresql", "flyway", "cli"]
+keywords = ["database", "migration", "postgresql", "mysql", "flyway"]
 categories = ["command-line-utilities", "database"]
 readme = "../README.md"
 documentation = "https://docs.rs/waypoint-core"
@@ -16,7 +16,7 @@ name = "waypoint"
 path = "src/main.rs"
 
 [dependencies]
-waypoint-core = { version = "0.3.4", path = "../waypoint-core" }
+waypoint-core = { version = "0.3.4", path = "../waypoint-core", default-features = false }
 clap = { version = "4", features = ["derive"] }
 comfy-table = "7"
 colored = "2"
@@ -33,8 +33,10 @@ flate2 = { version = "1", optional = true }
 tar = { version = "0.4", optional = true }
 
 [features]
-default = ["self-update"]
+default = ["self-update", "postgres"]
 self-update = ["dep:ureq", "dep:semver", "dep:flate2", "dep:tar", "dep:tempfile"]
+postgres = ["waypoint-core/postgres"]
+mysql = ["waypoint-core/mysql"]
 
 [build-dependencies]
 chrono = "0.4"

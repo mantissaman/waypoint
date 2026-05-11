@@ -325,6 +325,10 @@ async fn main() {
 }
 
 /// Map error types to differentiated exit codes.
+// ChecksumMismatch and DiffFailed are deprecated reserved variants that no
+// code path actually constructs. Their arms below are dead but kept until
+// the variants are removed in 0.4.0 (so the match remains exhaustive).
+#[allow(deprecated)]
 fn exit_code(error: &WaypointError) -> i32 {
     match error {
         WaypointError::ConfigError(_) => 2,
@@ -338,7 +342,10 @@ fn exit_code(error: &WaypointError) -> i32 {
         WaypointError::MissingDependency { .. } => 3,
         WaypointError::InvalidDirective { .. } => 3,
         WaypointError::MultiDbDependencyCycle { .. } => 3,
+        #[cfg(feature = "postgres")]
         WaypointError::DatabaseError(_) => 4,
+        #[cfg(feature = "mysql")]
+        WaypointError::MysqlError(_) => 4,
         WaypointError::ConnectionLost { .. } => 4,
         WaypointError::MigrationFailed { .. } => 5,
         WaypointError::MigrationParseError(_) => 5,
@@ -530,12 +537,13 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
 
         match &cli.command {
             Commands::Migrate { target } => {
-                let result = waypoint_core::MultiWaypoint::migrate(
+                let result = waypoint_core::MultiWaypoint::migrate_with_options(
                     databases,
                     &clients,
                     &order,
                     target.as_deref(),
                     cli.fail_fast,
+                    force,
                 )
                 .await?;
                 print_report!(result, json_output, output::print_multi_result);
@@ -584,7 +592,8 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
     if dry_run {
         if let Commands::Migrate { .. } = &cli.command {
             let wp = Waypoint::new(config).await?;
-            let report = waypoint_core::commands::explain::execute(wp.client(), &wp.config).await?;
+            let report =
+                waypoint_core::commands::explain::execute_db(wp.client(), &wp.config).await?;
             print_report!(report, json_output, output::print_explain_report);
             return Ok(());
         }
@@ -658,13 +667,7 @@ async fn run_single_db_command(
                 }
             }
 
-            let report = waypoint_core::commands::migrate::execute_with_options(
-                wp.client(),
-                &wp.config,
-                target.as_deref(),
-                force,
-            )
-            .await?;
+            let report = wp.migrate_with_options(target.as_deref(), force).await?;
             print_report!(report, json_output, quiet, output::print_migrate_summary);
         }
         Commands::Info => {
@@ -784,7 +787,7 @@ async fn run_single_db_command(
         Commands::Safety { file } => {
             if let Some(path) = file {
                 let report =
-                    waypoint_core::commands::safety::execute_file(wp.client(), &wp.config, path)
+                    waypoint_core::commands::safety::execute_file_db(wp.client(), &wp.config, path)
                         .await?;
                 print_report!(report, json_output, output::print_safety_report);
             } else {
@@ -838,6 +841,9 @@ async fn run_single_db_command(
 }
 
 /// Print a formatted error message with actionable hints to stderr.
+// Same deprecation-suppression as `exit_code` — keeps the match arms for
+// reserved variants until 0.4.0 drops the variants entirely.
+#[allow(deprecated)]
 fn print_error(error: &WaypointError) {
     eprintln!("{} {}", "ERROR:".red().bold(), error);
 
@@ -1043,5 +1049,7 @@ fn print_error(error: &WaypointError) {
         | WaypointError::GitError(_)
         | WaypointError::AdvisorError(_)
         | WaypointError::IoError(_) => {}
+        #[cfg(feature = "mysql")]
+        WaypointError::MysqlError(_) => {}
     }
 }

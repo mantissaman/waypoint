@@ -312,12 +312,14 @@ struct TomlSnapshotConfig {
     directory: Option<String>,
     auto_snapshot_on_migrate: Option<bool>,
     max_snapshots: Option<usize>,
+    strip_definer_mysql: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
 struct TomlPreflightConfig {
     enabled: Option<bool>,
     max_replication_lag_mb: Option<i64>,
+    max_replication_lag_secs: Option<i64>,
     long_query_threshold_secs: Option<i64>,
 }
 
@@ -356,6 +358,7 @@ struct TomlSafetyConfig {
     block_on_danger: Option<bool>,
     large_table_threshold: Option<i64>,
     huge_table_threshold: Option<i64>,
+    refresh_stats_mysql: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -530,11 +533,13 @@ impl WaypointConfig {
             }
             apply_option!(s.auto_snapshot_on_migrate => self.snapshots.auto_snapshot_on_migrate);
             apply_option!(s.max_snapshots => self.snapshots.max_snapshots);
+            apply_option!(s.strip_definer_mysql => self.snapshots.strip_definer_mysql);
         }
 
         if let Some(p) = toml.preflight {
             apply_option!(p.enabled => self.preflight.enabled);
             apply_option!(p.max_replication_lag_mb => self.preflight.max_replication_lag_mb);
+            apply_option!(p.max_replication_lag_secs => self.preflight.max_replication_lag_secs);
             apply_option!(p.long_query_threshold_secs => self.preflight.long_query_threshold_secs);
         }
 
@@ -560,6 +565,7 @@ impl WaypointConfig {
             apply_option!(s.block_on_danger => self.safety.block_on_danger);
             apply_option!(s.large_table_threshold => self.safety.large_table_threshold);
             apply_option!(s.huge_table_threshold => self.safety.huge_table_threshold);
+            apply_option!(s.refresh_stats_mysql => self.safety.refresh_stats_mysql);
         }
 
         if let Some(a) = toml.advisor {

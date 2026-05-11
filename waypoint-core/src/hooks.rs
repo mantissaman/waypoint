@@ -4,10 +4,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
 use crate::config::HooksConfig;
+#[cfg(feature = "postgres")]
 use crate::db;
+use crate::db::DbClient;
 use crate::error::{Result, WaypointError};
 use crate::placeholder::replace_placeholders;
 
@@ -179,6 +182,7 @@ pub fn load_config_hooks(config: &HooksConfig) -> Result<Vec<ResolvedHook>> {
 /// Run all hooks of a given type.
 ///
 /// Returns total execution time in milliseconds.
+#[cfg(feature = "postgres")]
 pub async fn run_hooks(
     client: &Client,
     hooks: &[ResolvedHook],
@@ -203,6 +207,60 @@ pub async fn run_hooks(
                     WaypointError::DatabaseError(db_err) => crate::error::format_db_error(db_err),
                     other => other.to_string(),
                 };
+                return Err(WaypointError::HookFailed {
+                    phase: phase.to_string(),
+                    script: hook.script_name.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+
+    Ok((count, total_ms))
+}
+
+/// Run all hooks of a given phase (dialect-aware entry).
+///
+/// On PostgreSQL each hook is wrapped in a transaction (matching the legacy
+/// `run_hooks` PG entry). On MySQL hooks execute via `execute_raw` — MySQL DDL
+/// auto-commits, so a transaction wrapper would buy nothing for DDL hooks.
+/// Returns `(hook_count, total_ms)`.
+pub async fn run_hooks_db(
+    client: &DbClient,
+    hooks: &[ResolvedHook],
+    phase: &HookType,
+    placeholders: &HashMap<String, String>,
+) -> Result<(usize, i32)> {
+    let mut total_ms = 0;
+    let mut count = 0;
+
+    for hook in hooks.iter().filter(|h| &h.hook_type == phase) {
+        log::info!("Running {} hook: {}", phase, hook.script_name);
+
+        let sql = replace_placeholders(&hook.sql, placeholders)?;
+
+        let exec_result = match client.dialect_kind() {
+            crate::dialect::DialectKind::Postgres => client.execute_in_transaction(&sql).await,
+            crate::dialect::DialectKind::Mysql => client.execute_raw(&sql).await,
+        };
+
+        match exec_result {
+            Ok(exec_time) => {
+                total_ms += exec_time;
+                count += 1;
+            }
+            Err(e) => {
+                // Match the legacy `run_hooks` error format: when the cause is
+                // a tokio_postgres::Error, surface the inner DbError detail/hint
+                // (`format_db_error`) without the "Database error: " prefix
+                // that WaypointError::Display would prepend.
+                #[cfg(feature = "postgres")]
+                let reason = match &e {
+                    WaypointError::DatabaseError(db_err) => crate::error::format_db_error(db_err),
+                    other => other.to_string(),
+                };
+                #[cfg(not(feature = "postgres"))]
+                let reason = e.to_string();
                 return Err(WaypointError::HookFailed {
                     phase: phase.to_string(),
                     script: hook.script_name.clone(),
@@ -250,7 +308,7 @@ mod tests {
         fs::write(dir.join("V1__Create_table.sql"), "CREATE TABLE t(id INT);").unwrap();
         fs::write(dir.join("R__Create_view.sql"), "CREATE VIEW v AS SELECT 1;").unwrap();
 
-        let hooks = scan_hooks(&[dir.clone()]).unwrap();
+        let hooks = scan_hooks(std::slice::from_ref(&dir)).unwrap();
 
         assert_eq!(hooks.len(), 2);
 
@@ -277,7 +335,7 @@ mod tests {
         fs::write(dir.join("beforeMigrate__A_first.sql"), "SELECT 1;").unwrap();
         fs::write(dir.join("beforeMigrate.sql"), "SELECT 0;").unwrap();
 
-        let hooks = scan_hooks(&[dir.clone()]).unwrap();
+        let hooks = scan_hooks(std::slice::from_ref(&dir)).unwrap();
 
         assert_eq!(hooks.len(), 3);
         assert_eq!(hooks[0].script_name, "beforeMigrate.sql");

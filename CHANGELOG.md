@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-05-11
+
+### Added — MySQL 8.0+ support (opt-in via `mysql` Cargo feature)
+
+Engine auto-detected from the connection URL scheme (`mysql://` → MySQL,
+`postgres://` / `postgresql://` → PostgreSQL). Existing PostgreSQL users see
+zero changes — the `postgres` feature is on by default.
+
+**Commands working end-to-end on MySQL 8.0+:**
+
+- `migrate` — with hooks (beforeMigrate, beforeEachMigrate, afterEachMigrate, afterMigrate), validate-on-migrate, preflight gating, and environment scoping. Refuses `batch_transaction = true` with a clear error since MySQL DDL is non-transactional.
+- `info`, `validate`, `repair`, `baseline` — full parity with PostgreSQL using the dialect-aware `_db` entry points.
+- `clean` — drops views, base tables, routines, and events; uses `FOREIGN_KEY_CHECKS = 0` so drop order doesn't matter.
+- `snapshot` / `restore` — backed by `SHOW CREATE TABLE` / `SHOW CREATE VIEW` rather than full schema introspection.
+- `undo` — supports manual `U{version}__*.sql` files plus auto-generated reversals on both engines.
+- `preflight` — 6 MySQL-specific checks: `@@read_only` / `@@super_read_only`, threads-connected vs `@@max_connections`, long-running queries from `information_schema.PROCESSLIST`, `Seconds_Behind_Source` from `SHOW REPLICA STATUS`, database size from `information_schema.TABLES`, pending metadata locks from `performance_schema.metadata_locks`.
+- `simulate` — replicates source structure into a throwaway database via `SHOW CREATE TABLE` and `SHOW CREATE VIEW` (with `\`source_db\`.` qualifier stripped so views bind to the temp database).
+- `lint`, `changelog`, `check-conflicts` — already engine-agnostic (no DB required).
+
+**Architecture:**
+
+- `dialect/` module with `DatabaseDialect` trait + `DialectKind` enum + `PostgresDialect` / `MysqlDialect` impls. Pure (no-DB) per-engine knobs: identifier quoting, history-table DDL, transactional-DDL capability.
+- `DbClient` enum wraps `tokio_postgres::Client` or `mysql_async::Pool`. Dialect-aware methods on `DbClient`: `acquire_lock`, `release_lock`, `current_user`, `current_database`, `resolve_schema`, `execute_raw`, `execute_in_transaction`.
+- "Schema" fallback: when the configured schema is the PG default `"public"`, MySQL paths fall back to `DATABASE()` so a PG-shaped config keeps working when pointed at MySQL.
+- Most ported commands keep a paired `execute(&Client, ...)` (PG legacy) + `execute_db(&DbClient, ...)` (dialect-aware) entry. Legacy entries serve internal callers in `multi.rs`, `explain.rs`, and the PG-specific helpers in `migrate.rs`.
+
+**Configuration:**
+
+- New `[preflight] max_replication_lag_secs` (default 30) — MySQL replica-lag threshold. Existing `max_replication_lag_mb` (default 100) remains PostgreSQL-only.
+- New `mysql` Cargo feature on both `waypoint-core` and `waypoint-cli`. Build with `--features mysql` to opt in.
+
+**Additional commands now working on MySQL:**
+
+- `guards` (`require` / `ensure`) — 9 of 10 builtin assertion functions ported to `information_schema` (`table_exists`, `column_exists`, `column_type`, `column_nullable`, `index_exists`, `constraint_exists`, `function_exists`, `row_count`, `sql`). `enum_exists` is explicitly unsupported on MySQL since ENUM is a column-type modifier, not a schema object.
+- `safety` — version-aware lock-level mapping for MySQL. On 8.0.29+ we detect `ALGORITHM=INSTANT`-eligible operations (`ADD COLUMN` nullable / NOT NULL with DEFAULT, `DROP COLUMN`) and downgrade them from worst-case `AccessExclusiveLock` to `LockLevel::None`. On older MySQL or when version detection fails, falls back to the conservative pessimistic mapping. Size classification from `information_schema.tables.table_rows`, optionally refreshed via `ANALYZE TABLE` first (`[safety] refresh_stats_mysql = true`). Suggestions tailored to MySQL (gh-ost for large index creation, upgrade-or-pt-osc for `DROP COLUMN` on < 8.0.29).
+- `advise` — new MySQL rule set `M001`-`M005`: FK column without index, table without primary key, non-utf8mb4 charset, non-InnoDB storage engine, duplicate indexes.
+- `diff` — `introspect_mysql` produces the same `SchemaSnapshot` shape as PG; structural diffs work across engines. Generated DDL is still PG-flavored; consume the structured `diffs[]` for MySQL.
+- `drift` — throwaway database + held connection with `USE temp_db`, replays applied migrations, diffs against the live database.
+- `explain` — `EXPLAIN FORMAT=JSON` with `access_type=ALL` (full table scan) surfaced as a warning.
+- Multi-database orchestration — `MultiWaypoint::connect` auto-detects per-database engine from URL scheme; one config can mix `postgres://` and `mysql://` entries.
+
+**Final pieces — full MySQL parity:**
+
+- `schema::generate_ddl_mysql` emits MySQL-flavored reverse DDL (backticks, `ENGINE=InnoDB`, no `CASCADE`). Dependent constraint/index/trigger diffs are filtered when their parent table is also being dropped in the same batch, since MySQL has no `CASCADE` on `DROP TABLE`.
+- `reversal::generate_reversal_db`, `store_reversal_db`, `get_reversal_db` are the new dialect-aware entries. PG legacy fns retained for back-compat. MySQL migrate now captures before-snapshots and stores reverse DDL automatically; MySQL undo falls back to it when no `U{ver}__*.sql` is present.
+- The `--no-default-features --features mysql` build (mysql-only, no PostgreSQL deps compiled in) is now green: clippy `-D warnings` clean, 155 unit tests pass.
+
+See `CLAUDE.md` for the full per-command status table — every command now works on both engines.
+
+**MySQL caution mitigations:**
+
+Closed the four production cautions previously documented in `docs/ENGINES.md`:
+
+- **Smarter safety verdicts.** `safety` now detects `@@version` and applies INSTANT-eligibility rules per operation: 8.0.29+ ADD COLUMN (nullable, or NOT NULL with DEFAULT) and DROP COLUMN downgrade to Safe; ALTER COLUMN TYPE and ADD COLUMN NOT NULL (no default) stay conservative. When version detection fails the fallback is conservative and logged as `log::warn!`.
+- **Refresh-on-demand row stats.** `[safety] refresh_stats_mysql = true` runs `ANALYZE TABLE` before reading `table_rows`, for accurate size classification when callers care more about correctness than the brief metadata lock.
+- **DEFINER stripping on snapshot.** `[snapshots] strip_definer_mysql = true` (default `true`) scrubs `DEFINER=...` and the redundant `SQL SECURITY DEFINER` from view DDL when capturing snapshots. View restore now works across accounts without needing `SUPER`/`SET_USER_ID`. Regex handles backtick-quoted, single-quoted, and `CURRENT_USER` / `CURRENT_USER()` forms.
+- **Cross-database view warnings in `simulate`.** `SimulationReport` now exposes a `warnings: Vec<String>` field. Replication failures during simulation (commonly: a view referencing another database not replicated into the temp DB) are surfaced as user-visible warnings — yellow `!` lines in the CLI, `warnings[]` in JSON. Cross-database refs are detected via a manual identifier walker and named explicitly in the warning.
+
+**Internal reorganization (no behaviour change):**
+
+- Engine-specific implementations moved under `engines/postgres/` and `engines/mysql/` for `history`, `migrate`, `advisor`, and `safety`. Top-level modules retain shared types and dialect-aware dispatchers; back-compat re-exports keep all public paths working.
+- `commands/migrate.rs` shrunk from ~1980 LOC to ~130 LOC (entry points and shared types only).
+
 ## [0.3.0] - 2026-02-20
 
 ### Added

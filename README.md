@@ -8,15 +8,47 @@
 [![Docker Pulls](https://img.shields.io/docker/pulls/tensorbeeio/waypoint)](https://hub.docker.com/r/tensorbeeio/waypoint)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Lightweight, Flyway-compatible PostgreSQL migration tool built in Rust.
+Lightweight, Flyway-compatible SQL migration tool built in Rust. Targets PostgreSQL (default) and MySQL 8.0+ (opt-in via the `mysql` Cargo feature).
 
 - **Fast** — single static binary, ~30MB Docker image
 - **Flyway-compatible** — same migration naming, CRC32 checksums, JDBC URL support
 - **Production-ready** — TLS via rustls, advisory locking, structured logging, retry with backoff
-- **Provably safe** — guarded migrations, safety analysis, auto-reversals, simulation
+- **Provably safe** — guarded migrations, safety analysis, auto-reversals (PG), simulation
 - **Schema intelligence** — diff, drift detection, snapshots, EXPLAIN dry-run, schema advisor
-- **Team-friendly** — lint, changelog, branch conflict detection, multi-database orchestration
+- **Team-friendly** — lint, changelog, branch conflict detection, multi-database orchestration (mixed PG + MySQL configs)
 - **Drop-in Docker replacement** — same env vars as Flyway containers
+- **Dual-engine** — full command coverage on PostgreSQL 12+ and MySQL 8.0+. Every command (migrate, guards, safety, advisor, diff, drift, explain, auto-reversal, undo, etc.) works on both engines
+
+## Database support
+
+Waypoint targets two engines with different levels of coverage. For a
+deeper look at parity, behavior differences, and production cautions, see
+[`docs/ENGINES.md`](docs/ENGINES.md).
+
+| | PostgreSQL 12+ | MySQL 8.0+ |
+|---|:---:|:---:|
+| **Cargo feature** | `postgres` (default) | `mysql` (opt-in) |
+| Connection URL | `postgres://...` / `postgresql://...` | `mysql://...` |
+| `migrate`, `info`, `validate`, `repair`, `baseline`, `clean` | Yes | Yes |
+| `snapshot`, `restore`, `simulate`, `preflight` | Yes | Yes |
+| `undo` (manual `U{ver}__*.sql` files) | Yes | Yes |
+| `lint`, `changelog`, `check-conflicts` (no-DB) | Yes | Yes |
+| Guard expressions (`require` / `ensure`) | Yes | Yes |
+| Safety analysis (lock levels, impact, verdicts) | Yes | Yes |
+| Schema advisor | Yes (A001-A010) | Yes (M001-M005) |
+| Schema diff | Yes | Yes (structured) |
+| Drift detection | Yes | Yes |
+| `EXPLAIN` dry-run | Yes | Yes (`FORMAT=JSON`) |
+| Multi-database orchestration (mixed engines) | Yes | Yes |
+| Auto-reversal generation | Yes | Yes |
+| Transactional DDL (`batch_transaction` mode) | Yes | — (MySQL DDL auto-commits) |
+
+Build with both backends:
+
+```bash
+cargo build --features mysql           # both postgres + mysql available
+cargo install waypoint-cli --features mysql
+```
 
 ## Waypoint vs Flyway
 
@@ -57,13 +89,13 @@ Waypoint is a Flyway-compatible alternative that includes many features Flyway r
 | CLI tool | JVM (~200 MB) | JVM (~200 MB) | Native (~4 MB) |
 | Docker image | JVM-based | JVM-based | Alpine (~21 MB) |
 | JVM required | Bundled | Bundled | No |
-| Database support | 30+ engines | 30+ engines | PostgreSQL |
+| Database support | 30+ engines | 30+ engines | PostgreSQL + MySQL 8.0+ |
 | License | Apache 2.0 / Freeware EULA | Proprietary | MIT |
 
 **Key takeaways:**
 - Features that Flyway charges for (undo, dry-run, lint, drift, snapshots, changelog, auto-undo) are free in Waypoint
 - Features that Flyway doesn't offer at any price (safety analysis, guard expressions, dependency ordering, conflict detection, simulation, preflight checks, multi-db orchestration) are included
-- Flyway supports 30+ database engines; Waypoint is PostgreSQL-only, enabling deeper PG-specific analysis
+- Flyway supports 30+ database engines; Waypoint targets PostgreSQL deeply (with full safety/advisor/guards/diff/drift analysis) and MySQL 8.0+ for core migration commands (with analysis commands ported incrementally)
 - Waypoint is a ~4 MB native binary with a ~21 MB Docker image vs Flyway's ~200 MB JVM-based distribution
 
 ## Install
@@ -103,7 +135,15 @@ cargo install --path waypoint-cli
 
 ```toml
 [dependencies]
+# PostgreSQL only (default)
 waypoint-core = "0.3"
+
+# Or MySQL 8.0+ only
+# waypoint-core = { version = "0.3", default-features = false, features = ["mysql"] }
+
+# Or both engines
+# waypoint-core = { version = "0.3", features = ["mysql"] }
+
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -116,8 +156,11 @@ docker pull tensorbeeio/waypoint:latest
 ## Quick Start
 
 ```bash
-# Apply migrations
+# Apply migrations (PostgreSQL)
 waypoint --url "postgres://user:pass@localhost:5432/mydb" migrate
+
+# Apply migrations (MySQL 8.0+, requires --features mysql at build/install time)
+waypoint --url "mysql://user:pass@localhost:3306/mydb" migrate
 
 # Show migration status
 waypoint --url "postgres://user:pass@localhost:5432/mydb" info
@@ -128,6 +171,9 @@ waypoint lint
 # Preview what would be applied
 waypoint --url "postgres://user:pass@localhost:5432/mydb" migrate --dry-run
 ```
+
+The engine is auto-detected from the connection URL scheme. `postgres://` /
+`postgresql://` → PostgreSQL; `mysql://` → MySQL.
 
 ## Migration Files
 

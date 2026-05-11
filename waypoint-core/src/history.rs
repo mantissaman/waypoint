@@ -1,10 +1,20 @@
-//! Schema history table operations (create, query, insert, update, delete).
+//! Schema history table operations.
+//!
+//! This module hosts the engine-agnostic types ([`AppliedMigration`],
+//! [`effective_applied_versions`]) and the dialect-aware dispatchers
+//! (the `*_db` functions) that route to the per-engine implementations
+//! in [`crate::engines::postgres::history`] / [`crate::engines::mysql::history`].
+//!
+//! Legacy PostgreSQL-only entry points (`create_history_table`,
+//! `get_applied_migrations`, etc.) are re-exported from
+//! [`crate::engines::postgres::history`] for back-compat — code that
+//! previously called `crate::history::create_history_table(&Client, …)`
+//! keeps working unchanged.
 
 use chrono::{DateTime, Utc};
-use tokio_postgres::Client;
 
-use crate::db::quote_ident;
-use crate::error::Result;
+use crate::db::DbClient;
+use crate::error::{Result, WaypointError};
 
 /// A row from the schema history table.
 #[derive(Debug, Clone)]
@@ -33,127 +43,108 @@ pub struct AppliedMigration {
     pub reversal_sql: Option<String>,
 }
 
-/// Create the schema history table if it does not exist.
-pub async fn create_history_table(client: &Client, schema: &str, table: &str) -> Result<()> {
-    let fq = format!("{}.{}", quote_ident(schema), quote_ident(table));
-    let idx_name = format!("{}_s_idx", table);
-    let ver_idx_name = format!("{}_v_idx", table);
-    let sql = format!(
-        r#"
-CREATE TABLE IF NOT EXISTS {fq} (
-    installed_rank INTEGER PRIMARY KEY,
-    version        VARCHAR(50),
-    description    VARCHAR(200) NOT NULL,
-    type           VARCHAR(20) NOT NULL,
-    script         VARCHAR(1000) NOT NULL,
-    checksum       INTEGER,
-    installed_by   VARCHAR(100) NOT NULL,
-    installed_on   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    execution_time INTEGER NOT NULL,
-    success        BOOLEAN NOT NULL,
-    reversal_sql   TEXT
-);
+// ── Re-exports of the legacy PG-only entry points ────────────────────────────
+//
+// External callers expect these names at `crate::history::*`. They live in
+// `crate::engines::postgres::history` now; this just makes the rename a
+// no-op for downstream code.
 
-CREATE INDEX IF NOT EXISTS {idx_name} ON {fq} (success);
-CREATE INDEX IF NOT EXISTS {ver_idx_name} ON {fq} (version);
-"#,
-        fq = fq,
-        idx_name = quote_ident(&idx_name),
-        ver_idx_name = quote_ident(&ver_idx_name),
-    );
+#[cfg(feature = "postgres")]
+pub use crate::engines::postgres::history::{
+    create_history_table, delete_failed_migrations, get_applied_migrations, has_entries,
+    history_table_exists, insert_applied_migration, next_installed_rank, update_checksum,
+    update_repeatable_checksum,
+};
 
-    client.batch_execute(&sql).await?;
+// ── Dialect-aware dispatchers ────────────────────────────────────────────────
 
-    // Auto-upgrade: add reversal_sql column if table already existed without it
-    upgrade_history_table(client, schema, table).await?;
-
+/// Create the schema history table if it does not exist (dialect-aware).
+pub async fn create_history_table_db(client: &DbClient, schema: &str, table: &str) -> Result<()> {
+    let dialect = client.dialect();
+    let ddl = dialect.history_table_ddl(schema, table);
+    // PG accepts the multi-statement string; MySQL needs per-statement
+    // execution. `execute_raw` handles both.
+    if let Err(e) = client.execute_raw(&ddl).await {
+        // Idempotent re-runs hit ER_DUP_KEYNAME on MySQL when an index already
+        // exists; treat that as benign.
+        if !is_benign_index_dup(&e) {
+            return Err(e);
+        }
+    }
+    upgrade_history_table_db(client, schema, table).await?;
     Ok(())
 }
 
 /// Auto-upgrade the history table to add new columns if they don't exist.
-async fn upgrade_history_table(client: &Client, schema: &str, table: &str) -> Result<()> {
-    let fq = format!("{}.{}", quote_ident(schema), quote_ident(table));
-    // Add reversal_sql column if it doesn't exist
-    let sql = format!(
-        "ALTER TABLE {fq} ADD COLUMN IF NOT EXISTS reversal_sql TEXT",
-        fq = fq,
-    );
-    // Ignore errors (e.g., if the column already exists on older PG without IF NOT EXISTS)
-    if let Err(e) = client.batch_execute(&sql).await {
+async fn upgrade_history_table_db(client: &DbClient, schema: &str, table: &str) -> Result<()> {
+    let dialect = client.dialect();
+    let fq = dialect.qualified_table(schema, table);
+    let sql = match client.dialect_kind() {
+        crate::dialect::DialectKind::Postgres => {
+            format!("ALTER TABLE {fq} ADD COLUMN IF NOT EXISTS reversal_sql TEXT")
+        }
+        crate::dialect::DialectKind::Mysql => {
+            // MySQL 8.0.29+ supports IF NOT EXISTS on ADD COLUMN; older
+            // patch versions error on duplicate column — caller log-ignores.
+            format!("ALTER TABLE {fq} ADD COLUMN IF NOT EXISTS reversal_sql LONGTEXT")
+        }
+    };
+    if let Err(e) = client.execute_raw(&sql).await {
         log::debug!("History table upgrade (reversal_sql): {}", e);
     }
     Ok(())
 }
 
-/// Check if the history table exists.
-pub async fn history_table_exists(client: &Client, schema: &str, table: &str) -> Result<bool> {
-    let row = client
-        .query_one(
-            "SELECT EXISTS (
-                SELECT FROM information_schema.tables
-                WHERE table_schema = $1 AND table_name = $2
-            )",
-            &[&schema, &table],
-        )
-        .await?;
-
-    Ok(row.get::<_, bool>(0))
+/// Whether an error message indicates a benign "duplicate index/key name"
+/// that occurs when re-running idempotent CREATE INDEX statements on MySQL.
+fn is_benign_index_dup(e: &WaypointError) -> bool {
+    // MySQL <8.0.29 lacks `CREATE INDEX IF NOT EXISTS` and emits ER_DUP_KEYNAME
+    // (error 1061, message "Duplicate key name '...'") when an index already
+    // exists. The CREATE TABLE / CREATE INDEX statements in our history DDL
+    // are otherwise idempotent (IF NOT EXISTS on the table, MySQL 8.0.29+
+    // accepts it on the index), so this is the only benign error we want to
+    // swallow. Avoid matching a broader "already exists" substring — that
+    // would also accept genuinely-broken cases like a table-creation race.
+    let msg = e.to_string().to_lowercase();
+    msg.contains("er_dup_keyname") || msg.contains("duplicate key name")
 }
 
-/// Get the next installed_rank value.
-pub async fn next_installed_rank(client: &Client, schema: &str, table: &str) -> Result<i32> {
-    let sql = format!(
-        "SELECT COALESCE(MAX(installed_rank), 0) + 1 FROM {}.{}",
-        quote_ident(schema),
-        quote_ident(table)
-    );
-    let row = client.query_one(&sql, &[]).await?;
-    Ok(row.get::<_, i32>(0))
+/// Check if the history table exists (dialect-aware).
+pub async fn history_table_exists_db(client: &DbClient, schema: &str, table: &str) -> Result<bool> {
+    match client {
+        #[cfg(feature = "postgres")]
+        DbClient::Postgres(c) => {
+            crate::engines::postgres::history::history_table_exists(c, schema, table).await
+        }
+        #[cfg(feature = "mysql")]
+        DbClient::Mysql(pool) => {
+            crate::engines::mysql::history::history_table_exists(pool, schema, table).await
+        }
+    }
 }
 
-/// Query all applied migrations from the history table.
-pub async fn get_applied_migrations(
-    client: &Client,
+/// Read all applied migrations ordered by `installed_rank` (dialect-aware).
+pub async fn get_applied_migrations_db(
+    client: &DbClient,
     schema: &str,
     table: &str,
 ) -> Result<Vec<AppliedMigration>> {
-    let sql = format!(
-        "SELECT installed_rank, version, description, type, script, checksum, \
-         installed_by, installed_on, execution_time, success, reversal_sql \
-         FROM {}.{} ORDER BY installed_rank",
-        quote_ident(schema),
-        quote_ident(table)
-    );
-
-    let rows = client.query(&sql, &[]).await?;
-
-    let mut migrations = Vec::with_capacity(rows.len());
-    for row in rows {
-        migrations.push(AppliedMigration {
-            installed_rank: row.get(0),
-            version: row.get(1),
-            description: row.get(2),
-            migration_type: row.get(3),
-            script: row.get(4),
-            checksum: row.get(5),
-            installed_by: row.get(6),
-            installed_on: row.get(7),
-            execution_time: row.get(8),
-            success: row.get(9),
-            reversal_sql: row.get(10),
-        });
+    match client {
+        #[cfg(feature = "postgres")]
+        DbClient::Postgres(c) => {
+            crate::engines::postgres::history::get_applied_migrations(c, schema, table).await
+        }
+        #[cfg(feature = "mysql")]
+        DbClient::Mysql(pool) => {
+            crate::engines::mysql::history::get_applied_migrations(pool, schema, table).await
+        }
     }
-
-    Ok(migrations)
 }
 
-/// Insert a migration record into the history table with atomic rank assignment.
-///
-/// Uses a subquery to atomically compute the next installed_rank within the INSERT,
-/// eliminating the race between reading the max rank and inserting.
+/// Insert a migration record into the history table (dialect-aware).
 #[allow(clippy::too_many_arguments)]
-pub async fn insert_applied_migration(
-    client: &Client,
+pub async fn insert_applied_migration_db(
+    client: &DbClient,
     schema: &str,
     table: &str,
     version: Option<&str>,
@@ -165,86 +156,151 @@ pub async fn insert_applied_migration(
     execution_time: i32,
     success: bool,
 ) -> Result<()> {
-    let fq = format!("{}.{}", quote_ident(schema), quote_ident(table));
-    let sql = format!(
-        "INSERT INTO {fq} \
-         (installed_rank, version, description, type, script, checksum, installed_by, execution_time, success) \
-         VALUES (\
-            (SELECT COALESCE(MAX(installed_rank), 0) + 1 FROM {fq}), \
-            $1, $2, $3, $4, $5, $6, $7, $8\
-         )",
-        fq = fq,
-    );
-
-    client
-        .execute(
-            &sql,
-            &[
-                &version,
-                &description,
-                &migration_type,
-                &script,
-                &checksum,
-                &installed_by,
-                &execution_time,
-                &success,
-            ],
-        )
-        .await?;
-
-    Ok(())
+    match client {
+        #[cfg(feature = "postgres")]
+        DbClient::Postgres(c) => {
+            crate::engines::postgres::history::insert_applied_migration(
+                c,
+                schema,
+                table,
+                version,
+                description,
+                migration_type,
+                script,
+                checksum,
+                installed_by,
+                execution_time,
+                success,
+            )
+            .await
+        }
+        #[cfg(feature = "mysql")]
+        DbClient::Mysql(pool) => {
+            crate::engines::mysql::history::insert_applied_migration(
+                pool,
+                schema,
+                table,
+                version,
+                description,
+                migration_type,
+                script,
+                checksum,
+                installed_by,
+                execution_time,
+                success,
+            )
+            .await
+        }
+    }
 }
 
-/// Delete all failed migration records (success = FALSE).
-pub async fn delete_failed_migrations(client: &Client, schema: &str, table: &str) -> Result<u64> {
-    let sql = format!(
-        "DELETE FROM {}.{} WHERE success = FALSE",
-        quote_ident(schema),
-        quote_ident(table)
-    );
-    let count = client.execute(&sql, &[]).await?;
-    Ok(count)
+/// Check if the history table has any entries (dialect-aware).
+pub async fn has_entries_db(client: &DbClient, schema: &str, table: &str) -> Result<bool> {
+    match client {
+        #[cfg(feature = "postgres")]
+        DbClient::Postgres(c) => {
+            crate::engines::postgres::history::has_entries(c, schema, table).await
+        }
+        #[cfg(feature = "mysql")]
+        DbClient::Mysql(pool) => {
+            crate::engines::mysql::history::has_entries(pool, schema, table).await
+        }
+    }
 }
 
-/// Update the checksum for a specific migration by version.
-pub async fn update_checksum(
-    client: &Client,
+/// Delete all failed migration records (dialect-aware).
+pub async fn delete_failed_migrations_db(
+    client: &DbClient,
+    schema: &str,
+    table: &str,
+) -> Result<u64> {
+    match client {
+        #[cfg(feature = "postgres")]
+        DbClient::Postgres(c) => {
+            crate::engines::postgres::history::delete_failed_migrations(c, schema, table).await
+        }
+        #[cfg(feature = "mysql")]
+        DbClient::Mysql(pool) => {
+            crate::engines::mysql::history::delete_failed_migrations(pool, schema, table).await
+        }
+    }
+}
+
+/// Update the checksum for a versioned migration (dialect-aware).
+pub async fn update_checksum_db(
+    client: &DbClient,
     schema: &str,
     table: &str,
     version: &str,
     new_checksum: i32,
 ) -> Result<()> {
-    let sql = format!(
-        "UPDATE {}.{} SET checksum = $1 WHERE version = $2",
-        quote_ident(schema),
-        quote_ident(table)
-    );
-    client.execute(&sql, &[&new_checksum, &version]).await?;
-    Ok(())
+    match client {
+        #[cfg(feature = "postgres")]
+        DbClient::Postgres(c) => {
+            crate::engines::postgres::history::update_checksum(
+                c,
+                schema,
+                table,
+                version,
+                new_checksum,
+            )
+            .await
+        }
+        #[cfg(feature = "mysql")]
+        DbClient::Mysql(pool) => {
+            crate::engines::mysql::history::update_checksum(
+                pool,
+                schema,
+                table,
+                version,
+                new_checksum,
+            )
+            .await
+        }
+    }
 }
 
-/// Update the checksum for a repeatable migration by script name (version is NULL).
-pub async fn update_repeatable_checksum(
-    client: &Client,
+/// Update the checksum for a repeatable migration (dialect-aware).
+pub async fn update_repeatable_checksum_db(
+    client: &DbClient,
     schema: &str,
     table: &str,
     script: &str,
     new_checksum: i32,
 ) -> Result<()> {
-    let sql = format!(
-        "UPDATE {}.{} SET checksum = $1 WHERE script = $2 AND version IS NULL",
-        quote_ident(schema),
-        quote_ident(table)
-    );
-    client.execute(&sql, &[&new_checksum, &script]).await?;
-    Ok(())
+    match client {
+        #[cfg(feature = "postgres")]
+        DbClient::Postgres(c) => {
+            crate::engines::postgres::history::update_repeatable_checksum(
+                c,
+                schema,
+                table,
+                script,
+                new_checksum,
+            )
+            .await
+        }
+        #[cfg(feature = "mysql")]
+        DbClient::Mysql(pool) => {
+            crate::engines::mysql::history::update_repeatable_checksum(
+                pool,
+                schema,
+                table,
+                script,
+                new_checksum,
+            )
+            .await
+        }
+    }
 }
+
+// ── Engine-agnostic helpers ──────────────────────────────────────────────────
 
 /// Compute the set of versions that are currently effectively applied.
 ///
 /// Processes history rows in `installed_rank` order (assumed already sorted).
-/// For each version, tracks whether the latest successful action was a forward
-/// migration (`"SQL"` / `"BASELINE"`) or an undo (`"UNDO_SQL"`).
+/// For each version, tracks whether the latest successful action was a
+/// forward migration (`"SQL"` / `"BASELINE"`) or an undo (`"UNDO_SQL"`).
 /// Returns the set of version strings that are currently applied.
 pub fn effective_applied_versions(
     applied: &[AppliedMigration],
@@ -263,15 +319,4 @@ pub fn effective_applied_versions(
         }
     }
     effective
-}
-
-/// Check if the history table has any entries.
-pub async fn has_entries(client: &Client, schema: &str, table: &str) -> Result<bool> {
-    let sql = format!(
-        "SELECT EXISTS (SELECT 1 FROM {}.{})",
-        quote_ident(schema),
-        quote_ident(table)
-    );
-    let row = client.query_one(&sql, &[]).await?;
-    Ok(row.get::<_, bool>(0))
 }

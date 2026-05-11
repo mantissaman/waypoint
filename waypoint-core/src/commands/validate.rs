@@ -3,11 +3,14 @@
 use std::collections::HashMap;
 
 use serde::Serialize;
+
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;
+use crate::db::DbClient;
 use crate::error::{Result, WaypointError};
-use crate::history;
+use crate::history::{self, AppliedMigration};
 use crate::migration::{scan_migrations, ResolvedMigration};
 
 /// Report returned after a validate operation.
@@ -21,29 +24,56 @@ pub struct ValidateReport {
     pub warnings: Vec<String>,
 }
 
-/// Execute the validate command.
-///
-/// For each applied (success=TRUE) migration in history:
-/// - Find the corresponding file on disk
-/// - Recalculate the checksum
-/// - Report mismatches
-/// - Warn if file is missing
+/// Execute the validate command (PostgreSQL legacy entry).
+#[cfg(feature = "postgres")]
 pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<ValidateReport> {
     let schema = &config.migrations.schema;
     let table = &config.migrations.table;
 
     if !history::history_table_exists(client, schema, table).await? {
-        return Ok(ValidateReport {
-            valid: true,
-            issues: Vec::new(),
-            warnings: vec!["No history table found — nothing to validate.".to_string()],
-        });
+        return Ok(empty_report());
     }
-
     let applied = history::get_applied_migrations(client, schema, table).await?;
     let resolved = scan_migrations(&config.migrations.locations)?;
+    finalise(check(applied, resolved))
+}
 
-    // Build lookup maps
+/// Execute the validate command (dialect-aware entry).
+pub async fn execute_db(client: &DbClient, config: &WaypointConfig) -> Result<ValidateReport> {
+    let schema = client.resolve_schema(&config.migrations.schema).await?;
+    let schema = schema.as_str();
+    let table = &config.migrations.table;
+
+    if !history::history_table_exists_db(client, schema, table).await? {
+        return Ok(empty_report());
+    }
+    let applied = history::get_applied_migrations_db(client, schema, table).await?;
+    let resolved = scan_migrations(&config.migrations.locations)?;
+    finalise(check(applied, resolved))
+}
+
+fn empty_report() -> ValidateReport {
+    ValidateReport {
+        valid: true,
+        issues: Vec::new(),
+        warnings: vec!["No history table found — nothing to validate.".to_string()],
+    }
+}
+
+fn finalise(report: ValidateReport) -> Result<ValidateReport> {
+    log::info!(
+        "Validation completed; valid={}, issue_count={}, warning_count={}",
+        report.valid,
+        report.issues.len(),
+        report.warnings.len()
+    );
+    if !report.valid {
+        return Err(WaypointError::ValidationFailed(report.issues.join("\n")));
+    }
+    Ok(report)
+}
+
+fn check(applied: Vec<AppliedMigration>, resolved: Vec<ResolvedMigration>) -> ValidateReport {
     let resolved_by_version: HashMap<String, &ResolvedMigration> = resolved
         .iter()
         .filter(|m| m.is_versioned())
@@ -63,16 +93,11 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Validat
         if !am.success {
             continue;
         }
-        if am.migration_type == "BASELINE" {
-            continue;
-        }
-        if am.migration_type == "UNDO_SQL" {
+        if am.migration_type == "BASELINE" || am.migration_type == "UNDO_SQL" {
             continue;
         }
 
-        // Distinguish by version presence for Flyway compatibility
         if am.version.is_some() {
-            // Versioned migration
             if let Some(ref version) = am.version {
                 if let Some(resolved) = resolved_by_version.get(version) {
                     if let Some(expected_checksum) = am.checksum {
@@ -91,34 +116,18 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Validat
                     ));
                 }
             }
-        } else {
-            // Repeatable (version is NULL) — we only warn on missing, don't fail on checksum diff
-            // (checksum diff is expected and triggers re-apply)
-            if !resolved_by_script.contains_key(&am.script) {
-                warnings.push(format!(
-                    "Applied repeatable migration '{}' not found on disk.",
-                    am.script
-                ));
-            }
+        } else if !resolved_by_script.contains_key(&am.script) {
+            warnings.push(format!(
+                "Applied repeatable migration '{}' not found on disk.",
+                am.script
+            ));
         }
     }
 
     let valid = issues.is_empty();
-
-    log::info!(
-        "Validation completed; valid={}, issue_count={}, warning_count={}",
-        valid,
-        issues.len(),
-        warnings.len()
-    );
-
-    if !valid {
-        return Err(WaypointError::ValidationFailed(issues.join("\n")));
-    }
-
-    Ok(ValidateReport {
+    ValidateReport {
         valid,
         issues,
         warnings,
-    })
+    }
 }

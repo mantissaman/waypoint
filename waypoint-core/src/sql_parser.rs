@@ -558,6 +558,91 @@ pub fn line_number_at(sql: &str, offset: usize) -> usize {
     sql[..offset.min(sql.len())].lines().count()
 }
 
+/// Split MySQL SQL into individual statements at top-level `;` terminators.
+///
+/// Respects single-quoted strings, double-quoted strings, backtick-quoted
+/// identifiers, single-line `--` comments, and `/* ... */` block comments.
+/// Does **not** handle MySQL's `DELIMITER //` blocks — stored-procedure DDL
+/// that needs an alternate delimiter must be split by the caller (or
+/// re-written without DELIMITER, which works for most ALTER/CREATE patterns).
+///
+/// Returns owned `String`s rather than borrowed slices so callers can pass
+/// them directly to `mysql_async::query_drop` without lifetime gymnastics.
+pub fn split_mysql_statements(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < len {
+        let c = bytes[i];
+        // Line comment
+        if c == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment
+        if c == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(len);
+            continue;
+        }
+        // Single-quoted string
+        if c == b'\'' {
+            i += 1;
+            while i < len && bytes[i] != b'\'' {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        // Double-quoted string
+        if c == b'"' {
+            i += 1;
+            while i < len && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        // Backtick-quoted identifier
+        if c == b'`' {
+            i += 1;
+            while i < len && bytes[i] != b'`' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // Statement terminator
+        if c == b';' {
+            out.push(sql[start..i].to_string());
+            i += 1;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    let tail = sql[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,5 +904,55 @@ mod tests {
         let sql = r"SELECT 'normal;string', E'escape\';string'; SELECT 2;";
         let stmts = split_statements(sql);
         assert_eq!(stmts.len(), 2);
+    }
+
+    #[test]
+    fn test_split_mysql_basic() {
+        let sql = "CREATE TABLE a (id INT); CREATE TABLE b (id INT);";
+        let stmts = split_mysql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("CREATE TABLE a"));
+        assert!(stmts[1].contains("CREATE TABLE b"));
+    }
+
+    #[test]
+    fn test_split_mysql_respects_backticks_with_semicolons() {
+        // A backtick-quoted identifier with `;` inside should NOT split.
+        let sql = "CREATE TABLE `weird;name` (id INT); CREATE TABLE b (id INT);";
+        let stmts = split_mysql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("`weird;name`"));
+    }
+
+    #[test]
+    fn test_split_mysql_respects_string_literals_with_semicolons() {
+        let sql = "INSERT INTO t VALUES ('a;b'); INSERT INTO t VALUES ('c;d');";
+        let stmts = split_mysql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+    }
+
+    #[test]
+    fn test_split_mysql_keeps_leading_comments_with_statement() {
+        // The first chunk contains both the comment header and the CREATE TABLE.
+        // Splitter doesn't emit comment-only fragments.
+        let sql = "-- header comment\nCREATE TABLE a (id INT);\nCREATE TABLE b (id INT);";
+        let stmts = split_mysql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("CREATE TABLE a"));
+    }
+
+    #[test]
+    fn test_split_mysql_handles_block_comments() {
+        let sql = "/* block ; comment */ CREATE TABLE a (id INT); CREATE TABLE b (id INT);";
+        let stmts = split_mysql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+    }
+
+    #[test]
+    fn test_split_mysql_no_trailing_semicolon() {
+        let sql = "CREATE TABLE a (id INT)";
+        let stmts = split_mysql_statements(sql);
+        assert_eq!(stmts.len(), 1);
+        assert!(stmts[0].contains("CREATE TABLE a"));
     }
 }

@@ -1,6 +1,7 @@
 //! Command implementations: migrate, info, validate, repair, baseline, clean,
-//! lint, changelog, diff, drift, snapshot, explain, preflight, check-conflicts,
-//! safety, advisor, simulate.
+//! lint, changelog, diff, drift, snapshot, explain, check-conflicts, safety,
+//! advisor, simulate. The `preflight` command is exposed via
+//! [`crate::preflight::run_preflight_db`] directly (no command-wrapper module).
 
 pub mod advisor;
 pub mod baseline;
@@ -13,7 +14,6 @@ pub mod explain;
 pub mod info;
 pub mod lint;
 pub mod migrate;
-pub mod preflight;
 pub mod repair;
 pub mod safety;
 pub mod simulate;

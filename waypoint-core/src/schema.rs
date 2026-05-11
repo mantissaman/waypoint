@@ -1,16 +1,32 @@
-//! PostgreSQL schema introspection, diff, and DDL generation.
+//! Schema introspection, diff, and DDL generation.
 //!
-//! Used by diff, drift, and snapshot commands.
+//! Used by diff, drift, snapshot, and reversal commands. Introspection has
+//! a PostgreSQL implementation ([`introspect`]) and a MySQL implementation
+//! ([`introspect_mysql`]); [`introspect_db`] dispatches based on engine.
+//! [`diff`] is engine-agnostic — it consumes [`SchemaSnapshot`] regardless
+//! of which engine produced it. DDL generation comes in two flavours:
+//! [`generate_ddl`] for PostgreSQL and [`generate_ddl_mysql`] for MySQL
+//! (the latter omits CASCADE and filters dependent constraint/index diffs
+//! when their parent table is being dropped, since MySQL has no CASCADE).
 
 use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
+
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
-use crate::db::quote_ident;
+use crate::db::{quote_ident, DbClient};
+use crate::dialect::DialectKind;
 use crate::error::Result;
+#[cfg(any(not(feature = "postgres"), not(feature = "mysql")))]
+use crate::error::WaypointError;
 
-/// Complete snapshot of a PostgreSQL schema.
+/// Complete snapshot of a database schema.
+///
+/// Populated by [`introspect`] on PostgreSQL and [`introspect_mysql`] on
+/// MySQL. Concepts that don't apply to MySQL (sequences, PG-style enums,
+/// extensions) come back as empty vectors when produced by `introspect_mysql`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SchemaSnapshot {
     /// All base tables in the schema.
@@ -175,7 +191,11 @@ pub enum SchemaDiff {
     /// An index was added in the target schema.
     IndexAdded(IndexDef),
     /// An index was dropped from the target schema.
-    IndexDropped(String),
+    ///
+    /// Carries both the index name and the table it belongs to — MySQL's
+    /// `DROP INDEX` syntax requires the table (unlike PostgreSQL where
+    /// indexes are schema-scoped).
+    IndexDropped { name: String, table_name: String },
     /// A view was added in the target schema.
     ViewAdded(ViewDef),
     /// A view was dropped from the target schema.
@@ -233,7 +253,9 @@ impl std::fmt::Display for SchemaDiff {
                 write!(f, "~ COLUMN {}.{}", table, column)
             }
             SchemaDiff::IndexAdded(idx) => write!(f, "+ INDEX {}", idx.name),
-            SchemaDiff::IndexDropped(n) => write!(f, "- INDEX {}", n),
+            SchemaDiff::IndexDropped { name, table_name } => {
+                write!(f, "- INDEX {} ON {}", name, table_name)
+            }
             SchemaDiff::ViewAdded(v) => write!(f, "+ VIEW {}", v.name),
             SchemaDiff::ViewDropped(n) => write!(f, "- VIEW {}", n),
             SchemaDiff::ViewAltered { name, .. } => write!(f, "~ VIEW {}", name),
@@ -260,7 +282,26 @@ impl std::fmt::Display for SchemaDiff {
     }
 }
 
+/// Introspect the current state of a schema (dialect-aware entry).
+pub async fn introspect_db(client: &DbClient, schema: &str) -> Result<SchemaSnapshot> {
+    match client.dialect_kind() {
+        #[cfg(feature = "postgres")]
+        DialectKind::Postgres => introspect(client.as_postgres()?, schema).await,
+        #[cfg(not(feature = "postgres"))]
+        DialectKind::Postgres => Err(WaypointError::ConfigError(
+            "PostgreSQL support is not compiled in".into(),
+        )),
+        #[cfg(feature = "mysql")]
+        DialectKind::Mysql => introspect_mysql(client, schema).await,
+        #[cfg(not(feature = "mysql"))]
+        DialectKind::Mysql => Err(WaypointError::ConfigError(
+            "MySQL support is not compiled in".into(),
+        )),
+    }
+}
+
 /// Introspect the current state of a PostgreSQL schema.
+#[cfg(feature = "postgres")]
 pub async fn introspect(client: &Client, schema: &str) -> Result<SchemaSnapshot> {
     let (tables, views, indexes, sequences, functions, enums, constraints, triggers, extensions) =
         tokio::try_join!(
@@ -288,6 +329,7 @@ pub async fn introspect(client: &Client, schema: &str) -> Result<SchemaSnapshot>
     })
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_tables(client: &Client, schema: &str) -> Result<Vec<TableDef>> {
     let rows = client
         .query(
@@ -343,6 +385,7 @@ async fn introspect_tables(client: &Client, schema: &str) -> Result<Vec<TableDef
     Ok(tables)
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_views(client: &Client, schema: &str) -> Result<Vec<ViewDef>> {
     // Regular views
     let rows = client
@@ -389,6 +432,7 @@ async fn introspect_views(client: &Client, schema: &str) -> Result<Vec<ViewDef>>
     Ok(views)
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_indexes(client: &Client, schema: &str) -> Result<Vec<IndexDef>> {
     let rows = client
         .query(
@@ -415,6 +459,7 @@ async fn introspect_indexes(client: &Client, schema: &str) -> Result<Vec<IndexDe
         .collect())
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_sequences(client: &Client, schema: &str) -> Result<Vec<SequenceDef>> {
     let rows = client
         .query(
@@ -436,6 +481,7 @@ async fn introspect_sequences(client: &Client, schema: &str) -> Result<Vec<Seque
         .collect())
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_functions(client: &Client, schema: &str) -> Result<Vec<FunctionDef>> {
     let rows = client
         .query(
@@ -467,6 +513,7 @@ async fn introspect_functions(client: &Client, schema: &str) -> Result<Vec<Funct
         .collect())
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_enums(client: &Client, schema: &str) -> Result<Vec<EnumDef>> {
     let rows = client
         .query(
@@ -491,6 +538,7 @@ async fn introspect_enums(client: &Client, schema: &str) -> Result<Vec<EnumDef>>
         .collect())
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_constraints(client: &Client, schema: &str) -> Result<Vec<ConstraintDef>> {
     let rows = client
         .query(
@@ -517,6 +565,7 @@ async fn introspect_constraints(client: &Client, schema: &str) -> Result<Vec<Con
         .collect())
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_triggers(client: &Client, schema: &str) -> Result<Vec<TriggerDef>> {
     let rows = client
         .query(
@@ -539,6 +588,7 @@ async fn introspect_triggers(client: &Client, schema: &str) -> Result<Vec<Trigge
         .collect())
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_extensions(client: &Client) -> Result<Vec<String>> {
     let rows = client
         .query(
@@ -658,7 +708,10 @@ pub fn diff(before: &SchemaSnapshot, after: &SchemaSnapshot) -> Vec<SchemaDiff> 
     // Indexes: check dropped then added
     for bi in &before.indexes {
         if !after_indexes.contains(bi.name.as_str()) {
-            diffs.push(SchemaDiff::IndexDropped(bi.name.clone()));
+            diffs.push(SchemaDiff::IndexDropped {
+                name: bi.name.clone(),
+                table_name: bi.table_name.clone(),
+            });
         }
     }
     for ai in &after.indexes {
@@ -891,7 +944,8 @@ pub fn generate_ddl(diffs: &[SchemaDiff]) -> String {
             SchemaDiff::IndexAdded(idx) => {
                 statements.push(format!("{};", idx.definition));
             }
-            SchemaDiff::IndexDropped(name) => {
+            SchemaDiff::IndexDropped { name, .. } => {
+                // PG: indexes are schema-scoped, no ON clause needed.
                 statements.push(format!("DROP INDEX IF EXISTS {};", quote_ident(name)));
             }
             SchemaDiff::ViewAdded(v) => {
@@ -1093,4 +1147,463 @@ pub fn to_ddl(snapshot: &SchemaSnapshot) -> String {
     }
 
     statements.join("\n\n")
+}
+
+/// Generate MySQL-flavored DDL from a list of schema diffs.
+///
+/// Mirrors [`generate_ddl`] but emits MySQL syntax: backtick-quoted identifiers,
+/// no `CASCADE` on DROPs (MySQL doesn't accept it), and skips diffs that
+/// reference a table that's also being dropped (since MySQL has no `CASCADE`
+/// and the dependent ALTER would fail with `Table doesn't exist`).
+pub fn generate_ddl_mysql(diffs: &[SchemaDiff]) -> String {
+    fn q(name: &str) -> String {
+        format!("`{}`", name.replace('`', "``"))
+    }
+
+    // First pass: collect the set of tables being dropped so we can skip
+    // dependent diffs (constraints, indexes, triggers) that reference them.
+    // PG uses `DROP TABLE ... CASCADE` to handle this transparently; MySQL
+    // has no such cascade so we filter explicitly.
+    let dropped_tables: std::collections::HashSet<&str> = diffs
+        .iter()
+        .filter_map(|d| match d {
+            SchemaDiff::TableDropped(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let references_dropped_table = |t: &str| dropped_tables.contains(t);
+
+    // Order: emit dependent diffs (constraints/indexes/triggers) FIRST when
+    // their table is NOT being dropped, then table-level changes, then
+    // TableDropped last. This matches MySQL's typical migration order and
+    // avoids dependency violations.
+    let mut statements = Vec::new();
+    for d in diffs {
+        // Skip diffs whose parent table is going away in this same batch.
+        // `DROP TABLE` on MySQL drops the table's indexes/constraints/triggers
+        // along with it, and trying to drop them separately after the table is
+        // gone fails with "Table doesn't exist".
+        match d {
+            SchemaDiff::ColumnAdded { table, .. }
+            | SchemaDiff::ColumnDropped { table, .. }
+            | SchemaDiff::ColumnAltered { table, .. }
+            | SchemaDiff::ConstraintDropped { table, .. }
+            | SchemaDiff::TriggerDropped { table, .. }
+            | SchemaDiff::IndexDropped {
+                table_name: table, ..
+            } => {
+                if references_dropped_table(table) {
+                    continue;
+                }
+            }
+            SchemaDiff::ConstraintAdded(c) if references_dropped_table(&c.table_name) => continue,
+            SchemaDiff::TriggerAdded(t) if references_dropped_table(&t.table_name) => continue,
+            SchemaDiff::IndexAdded(i) if references_dropped_table(&i.table_name) => continue,
+            _ => {}
+        }
+        match d {
+            SchemaDiff::TableAdded(t) => {
+                let cols: Vec<String> = t
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        let mut col = format!("    {} {}", q(&c.name), c.data_type);
+                        if !c.is_nullable {
+                            col.push_str(" NOT NULL");
+                        }
+                        if let Some(ref default) = c.default {
+                            col.push_str(&format!(" DEFAULT {}", default));
+                        }
+                        col
+                    })
+                    .collect();
+                statements.push(format!(
+                    "CREATE TABLE {} (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;",
+                    q(&t.name),
+                    cols.join(",\n")
+                ));
+            }
+            SchemaDiff::TableDropped(name) => {
+                statements.push(format!("DROP TABLE IF EXISTS {};", q(name)));
+            }
+            SchemaDiff::ColumnAdded { table, column } => {
+                let mut stmt = format!(
+                    "ALTER TABLE {} ADD COLUMN {} {}",
+                    q(table),
+                    q(&column.name),
+                    column.data_type
+                );
+                if !column.is_nullable {
+                    stmt.push_str(" NOT NULL");
+                }
+                if let Some(ref default) = column.default {
+                    stmt.push_str(&format!(" DEFAULT {}", default));
+                }
+                stmt.push(';');
+                statements.push(stmt);
+            }
+            SchemaDiff::ColumnDropped { table, column } => {
+                statements.push(format!(
+                    "ALTER TABLE {} DROP COLUMN {};",
+                    q(table),
+                    q(column)
+                ));
+            }
+            SchemaDiff::ColumnAltered {
+                table, column, to, ..
+            } => {
+                // MySQL collapses type+null+default into a single MODIFY COLUMN.
+                let mut clause = format!(
+                    "ALTER TABLE {} MODIFY COLUMN {} {}",
+                    q(table),
+                    q(column),
+                    to.data_type
+                );
+                if !to.is_nullable {
+                    clause.push_str(" NOT NULL");
+                }
+                if let Some(ref default) = to.default {
+                    clause.push_str(&format!(" DEFAULT {}", default));
+                }
+                clause.push(';');
+                statements.push(clause);
+            }
+            SchemaDiff::IndexAdded(idx) => {
+                // idx.definition is already MySQL-shaped from introspect_mysql.
+                statements.push(format!("{};", idx.definition.trim_end_matches(';')));
+            }
+            SchemaDiff::IndexDropped { name, table_name } => {
+                // MySQL requires `DROP INDEX <name> ON <table>`.
+                statements.push(format!("DROP INDEX {} ON {};", q(name), q(table_name)));
+            }
+            SchemaDiff::ViewAdded(v) => {
+                statements.push(format!(
+                    "CREATE VIEW {} AS {};",
+                    q(&v.name),
+                    v.definition.trim_end_matches(';').trim()
+                ));
+            }
+            SchemaDiff::ViewDropped(name) => {
+                statements.push(format!("DROP VIEW IF EXISTS {};", q(name)));
+            }
+            SchemaDiff::ViewAltered { name, to, .. } => {
+                statements.push(format!(
+                    "CREATE OR REPLACE VIEW {} AS {};",
+                    q(name),
+                    to.trim_end_matches(';').trim()
+                ));
+            }
+            SchemaDiff::SequenceAdded(_) | SchemaDiff::SequenceDropped(_) => {
+                // MySQL has no sequences; emit a comment.
+                statements.push("-- (sequence diff omitted: MySQL has no sequences)".into());
+            }
+            SchemaDiff::FunctionAdded(func) => {
+                statements.push(format!("{};", func.definition.trim_end_matches(';')));
+            }
+            SchemaDiff::FunctionDropped(name) => {
+                statements.push(format!("DROP FUNCTION IF EXISTS {};", q(name)));
+            }
+            SchemaDiff::FunctionAltered { name } => {
+                statements.push(format!(
+                    "-- Function {} altered; manual review needed",
+                    name
+                ));
+            }
+            SchemaDiff::EnumAdded(_) | SchemaDiff::EnumDropped(_) => {
+                statements
+                    .push("-- (enum diff omitted: MySQL ENUM is a column-type modifier)".into());
+            }
+            SchemaDiff::ConstraintAdded(c) => {
+                if c.definition.is_empty() {
+                    statements.push(format!(
+                        "-- ALTER TABLE {} ADD CONSTRAINT {} (definition unavailable)",
+                        q(&c.table_name),
+                        q(&c.name)
+                    ));
+                } else {
+                    statements.push(format!(
+                        "ALTER TABLE {} ADD CONSTRAINT {} {};",
+                        q(&c.table_name),
+                        q(&c.name),
+                        c.definition
+                    ));
+                }
+            }
+            SchemaDiff::ConstraintDropped { table, name } => {
+                statements.push(format!(
+                    "ALTER TABLE {} DROP CONSTRAINT {};",
+                    q(table),
+                    q(name)
+                ));
+            }
+            SchemaDiff::TriggerAdded(t) => {
+                statements.push(format!(
+                    "-- Trigger {} on {}: {}",
+                    t.name, t.table_name, t.definition
+                ));
+            }
+            SchemaDiff::TriggerDropped { table, name } => {
+                statements.push(format!("DROP TRIGGER IF EXISTS {}.{};", q(table), q(name)));
+            }
+            SchemaDiff::ExtensionAdded(_) | SchemaDiff::ExtensionDropped(_) => {
+                statements.push("-- (extension diff omitted: MySQL has no extensions)".into());
+            }
+        }
+    }
+    statements.join("\n\n")
+}
+
+// ── MySQL schema introspection ───────────────────────────────────────────────
+//
+// Produces the same SchemaSnapshot shape as PG `introspect()` so `diff()`
+// works on either dialect. Concepts that don't exist on MySQL (sequences,
+// PG-style enums, extensions) come back as empty vectors. Materialized views
+// don't exist on MySQL 8.0 so `is_materialized` is always false here.
+
+#[cfg(feature = "mysql")]
+pub async fn introspect_mysql(client: &DbClient, schema: &str) -> Result<SchemaSnapshot> {
+    use mysql_async::prelude::*;
+    let pool = client.as_mysql()?;
+    let mut conn = pool.get_conn().await?;
+
+    // Tables + columns (one row per column).
+    let column_rows: Vec<(String, String, String, String, Option<String>, i32)> = conn
+        .exec(
+            "SELECT t.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, \
+                    c.COLUMN_DEFAULT, c.ORDINAL_POSITION \
+             FROM information_schema.TABLES t \
+             JOIN information_schema.COLUMNS c \
+               ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME \
+             WHERE t.TABLE_SCHEMA = ? AND t.TABLE_TYPE = 'BASE TABLE' \
+             ORDER BY t.TABLE_NAME, c.ORDINAL_POSITION",
+            (schema,),
+        )
+        .await?;
+    let mut table_map: HashMap<String, Vec<ColumnDef>> = HashMap::new();
+    for (table, col, dtype, nullable, default, ord) in column_rows {
+        table_map.entry(table).or_default().push(ColumnDef {
+            name: col,
+            data_type: dtype,
+            is_nullable: nullable == "YES",
+            default,
+            ordinal_position: ord,
+        });
+    }
+    let mut tables: Vec<TableDef> = table_map
+        .into_iter()
+        .map(|(name, columns)| TableDef {
+            schema: schema.to_string(),
+            name,
+            columns,
+        })
+        .collect();
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Views.
+    let view_rows: Vec<(String, String)> = conn
+        .exec(
+            "SELECT TABLE_NAME, VIEW_DEFINITION FROM information_schema.VIEWS \
+             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
+            (schema,),
+        )
+        .await?;
+    let views: Vec<ViewDef> = view_rows
+        .into_iter()
+        .map(|(name, def)| ViewDef {
+            schema: schema.to_string(),
+            name,
+            definition: def,
+            is_materialized: false,
+        })
+        .collect();
+
+    // Indexes — group STATISTICS rows by (table, index_name). PRIMARY indexes
+    // surface as primary-key constraints instead.
+    let index_rows: Vec<(String, String, i32, String, i64)> = conn
+        .exec(
+            "SELECT TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NON_UNIQUE \
+             FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = ? AND INDEX_NAME <> 'PRIMARY' \
+             ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
+            (schema,),
+        )
+        .await?;
+    let mut idx_map: HashMap<(String, String), (Vec<String>, bool)> = HashMap::new();
+    for (table, idx_name, _seq, col, non_unique) in index_rows {
+        let entry = idx_map
+            .entry((table, idx_name))
+            .or_insert_with(|| (Vec::new(), non_unique == 0));
+        entry.0.push(col);
+    }
+    let mut indexes: Vec<IndexDef> = idx_map
+        .into_iter()
+        .map(|((table, name), (cols, is_unique))| {
+            let kw = if is_unique {
+                "CREATE UNIQUE INDEX"
+            } else {
+                "CREATE INDEX"
+            };
+            let definition = format!(
+                "{} `{}` ON `{}` ({})",
+                kw,
+                name,
+                table,
+                cols.iter()
+                    .map(|c| format!("`{}`", c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            IndexDef {
+                schema: schema.to_string(),
+                name,
+                table_name: table,
+                definition,
+                is_unique,
+            }
+        })
+        .collect();
+    indexes.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Routines (procedures + functions). We store both via FunctionDef.
+    let routine_rows: Vec<(String, String, String, String)> = conn
+        .exec(
+            "SELECT ROUTINE_NAME, \
+                    COALESCE(DTD_IDENTIFIER, ''), \
+                    COALESCE(EXTERNAL_LANGUAGE, ROUTINE_BODY), \
+                    COALESCE(ROUTINE_DEFINITION, '') \
+             FROM information_schema.ROUTINES \
+             WHERE ROUTINE_SCHEMA = ? ORDER BY ROUTINE_NAME",
+            (schema,),
+        )
+        .await?;
+    let functions: Vec<FunctionDef> = routine_rows
+        .into_iter()
+        .map(|(name, return_type, language, definition)| FunctionDef {
+            schema: schema.to_string(),
+            name,
+            arguments: String::new(),
+            return_type,
+            language,
+            definition,
+        })
+        .collect();
+
+    // Constraints — PK / UNIQUE / FK. Definition is left empty for the diff
+    // shape; the constraint type + name is the structural signal.
+    let constraint_rows: Vec<(String, String, String)> = conn
+        .exec(
+            "SELECT TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE \
+             FROM information_schema.TABLE_CONSTRAINTS \
+             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, CONSTRAINT_NAME",
+            (schema,),
+        )
+        .await?;
+    let constraints: Vec<ConstraintDef> = constraint_rows
+        .into_iter()
+        .map(|(table, name, ctype)| ConstraintDef {
+            schema: schema.to_string(),
+            table_name: table,
+            name,
+            constraint_type: ctype,
+            definition: String::new(),
+        })
+        .collect();
+
+    // Triggers.
+    let trigger_rows: Vec<(String, String, String)> = conn
+        .exec(
+            "SELECT EVENT_OBJECT_TABLE, TRIGGER_NAME, ACTION_STATEMENT \
+             FROM information_schema.TRIGGERS \
+             WHERE TRIGGER_SCHEMA = ? ORDER BY EVENT_OBJECT_TABLE, TRIGGER_NAME",
+            (schema,),
+        )
+        .await?;
+    let triggers: Vec<TriggerDef> = trigger_rows
+        .into_iter()
+        .map(|(table_name, name, definition)| TriggerDef {
+            schema: schema.to_string(),
+            table_name,
+            name,
+            definition,
+        })
+        .collect();
+
+    Ok(SchemaSnapshot {
+        tables,
+        views,
+        indexes,
+        sequences: Vec::new(),
+        functions,
+        enums: Vec::new(),
+        constraints,
+        triggers,
+        extensions: Vec::new(),
+    })
+}
+
+#[cfg(test)]
+mod tests_generate_ddl_mysql {
+    use super::*;
+
+    fn col(name: &str, ty: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.into(),
+            data_type: ty.into(),
+            is_nullable: false,
+            default: None,
+            ordinal_position: 1,
+        }
+    }
+
+    #[test]
+    fn drop_index_emits_on_clause() {
+        let diffs = vec![SchemaDiff::IndexDropped {
+            name: "idx_users_email".into(),
+            table_name: "users".into(),
+        }];
+        let sql = generate_ddl_mysql(&diffs);
+        assert!(sql.contains("DROP INDEX `idx_users_email` ON `users`"));
+        // No PG-style "DROP INDEX IF EXISTS ...;" without ON clause.
+        assert!(!sql.contains("DROP INDEX `idx_users_email`;"));
+    }
+
+    #[test]
+    fn dependent_diffs_filtered_when_parent_table_dropped() {
+        // If we have TableDropped(t) AND ConstraintDropped/IndexDropped/
+        // ColumnAltered/etc. referencing t, only the TableDropped should remain
+        // in the output (others are implicit on MySQL).
+        let diffs = vec![
+            SchemaDiff::ConstraintDropped {
+                table: "t".into(),
+                name: "PRIMARY".into(),
+            },
+            SchemaDiff::IndexDropped {
+                name: "idx_t_x".into(),
+                table_name: "t".into(),
+            },
+            SchemaDiff::ColumnDropped {
+                table: "t".into(),
+                column: "x".into(),
+            },
+            SchemaDiff::TableDropped("t".into()),
+        ];
+        let sql = generate_ddl_mysql(&diffs);
+        assert!(sql.contains("DROP TABLE IF EXISTS `t`;"));
+        assert!(!sql.contains("DROP CONSTRAINT"));
+        assert!(!sql.contains("DROP INDEX `idx_t_x`"));
+        assert!(!sql.contains("DROP COLUMN"));
+    }
+
+    #[test]
+    fn table_added_uses_innodb_utf8mb4() {
+        let diffs = vec![SchemaDiff::TableAdded(TableDef {
+            schema: "db".into(),
+            name: "t".into(),
+            columns: vec![col("id", "int")],
+        })];
+        let sql = generate_ddl_mysql(&diffs);
+        assert!(sql.contains("CREATE TABLE `t`"));
+        assert!(sql.contains("ENGINE=InnoDB"));
+        assert!(sql.contains("utf8mb4"));
+    }
 }
