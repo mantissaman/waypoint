@@ -7,9 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo build                                              # Build both crates (default: postgres feature)
 cargo build --features mysql                             # Build with MySQL backend
-cargo test --lib                                         # Unit tests (postgres only, 257 tests)
-cargo test --features mysql --lib                        # Unit tests with both backends (262 tests)
-cargo test --features mysql --test mysql_integration_test  # MySQL integration tests (17 tests, needs container)
+cargo test --lib                                         # Unit tests (postgres only, 261 tests)
+cargo test --features mysql --lib                        # Unit tests with both backends (264 tests)
+cargo test --features mysql --test mysql_integration_test  # MySQL integration tests (18 tests, needs container)
 cargo test                                               # Integration tests need TEST_DATABASE_URL (PG)
 cargo clippy --features mysql --all-targets -- -D warnings  # Lint (use --features mysql to cover both paths)
 cargo fmt --check                                        # Format check
@@ -42,7 +42,7 @@ Cargo workspace with two crates:
 | Module | Purpose |
 |---|---|
 | `config.rs` | Config loading: TOML file + env vars + CLI overrides, 4-layer priority |
-| `dialect/` | `DatabaseDialect` trait + `DialectKind` enum + Postgres/MySQL impls. Pure (no-DB) per-engine knobs: identifier quoting, history-table DDL, placeholder syntax, statement-timeout SQL, transactional-DDL capability |
+| `dialect/` | `DatabaseDialect` trait + `DialectKind` enum + Postgres/MySQL impls. Pure (no-DB) per-engine knobs: identifier quoting, history-table DDL, transactional-DDL capability (gates batch-transaction mode) |
 | `migration.rs` | `ResolvedMigration`, `MigrationVersion`, filename parsing, file scanning |
 | `checksum.rs` | CRC32 checksum (line-by-line, Flyway-compatible) |
 | `placeholder.rs` | `${key}` placeholder replacement in SQL |

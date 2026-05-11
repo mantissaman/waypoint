@@ -37,30 +37,65 @@ fn db_url(database: &str) -> String {
     }
 }
 
-async fn fresh_database(prefix: &str) -> String {
-    let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let name = format!("waypoint_test_{}_{}", prefix, id);
-    let pool = mysql_async::Pool::from_url(root_url()).expect("invalid root URL");
-    let mut conn = pool.get_conn().await.expect("connect mysql");
-    conn.query_drop(format!("DROP DATABASE IF EXISTS `{}`", name))
-        .await
-        .expect("drop db");
-    conn.query_drop(format!("CREATE DATABASE `{}`", name))
-        .await
-        .expect("create db");
-    drop(conn);
-    pool.disconnect().await.ok();
-    name
+/// RAII guard for a per-test MySQL database. Drop spawns an async cleanup
+/// task so the database is dropped even when a test panics — best-effort
+/// since we can't `await` from `Drop`. Combined with `DROP DATABASE IF EXISTS`
+/// on creation, the next test run cleans up any leaks from earlier runs.
+struct TestDb {
+    name: String,
 }
 
-async fn drop_database(name: &str) {
-    let pool = mysql_async::Pool::from_url(root_url()).expect("invalid root URL");
-    let mut conn = pool.get_conn().await.expect("connect mysql");
-    let _ = conn
-        .query_drop(format!("DROP DATABASE IF EXISTS `{}`", name))
-        .await;
-    drop(conn);
-    pool.disconnect().await.ok();
+impl TestDb {
+    async fn create(prefix: &str) -> Self {
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let name = format!("waypoint_test_{}_{}", prefix, id);
+        let pool = mysql_async::Pool::from_url(root_url()).expect("invalid root URL");
+        let mut conn = pool.get_conn().await.expect("connect mysql");
+        conn.query_drop(format!("DROP DATABASE IF EXISTS `{}`", name))
+            .await
+            .expect("drop db");
+        conn.query_drop(format!("CREATE DATABASE `{}`", name))
+            .await
+            .expect("create db");
+        drop(conn);
+        pool.disconnect().await.ok();
+        TestDb { name }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Drop for TestDb {
+    fn drop(&mut self) {
+        let name = self.name.clone();
+        // We're typically inside #[tokio::test]'s current-thread runtime. Spawn
+        // a fire-and-forget cleanup task — it runs as the runtime unwinds. If
+        // the runtime tears down before it completes, the next run's
+        // DROP IF EXISTS picks up the orphan.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let pool = match mysql_async::Pool::from_url(root_url()) {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                if let Ok(mut conn) = pool.get_conn().await {
+                    let _ = conn
+                        .query_drop(format!("DROP DATABASE IF EXISTS `{}`", name))
+                        .await;
+                }
+                pool.disconnect().await.ok();
+            });
+        }
+    }
+}
+
+/// Convenience: create a fresh test database. Caller MUST bind the returned
+/// `TestDb` (e.g. `let db = fresh_database("x").await; let name = db.name();`)
+/// so the guard's Drop fires when the test function returns or panics.
+async fn fresh_database(prefix: &str) -> TestDb {
+    TestDb::create(prefix).await
 }
 
 fn write_migrations(dir: &std::path::Path, files: &[(&str, &str)]) {
@@ -95,17 +130,18 @@ fn config_for(db_name: &str, migrations_dir: PathBuf) -> WaypointConfig {
 
 #[tokio::test]
 async fn dialect_kind_detected_from_url() {
-    let name = fresh_database("dialect").await;
+    let db = fresh_database("dialect").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
-    let config = config_for(&name, tempdir.path().to_path_buf());
+    let config = config_for(name, tempdir.path().to_path_buf());
     let wp = Waypoint::new(config).await.expect("connect");
     assert_eq!(wp.client().dialect_kind(), DialectKind::Mysql);
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn migrate_creates_history_table_and_applies_versioned_migrations() {
-    let name = fresh_database("apply").await;
+    let db = fresh_database("apply").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(
@@ -122,7 +158,7 @@ async fn migrate_creates_history_table_and_applies_versioned_migrations() {
         ],
     );
 
-    let config = config_for(&name, migrations);
+    let config = config_for(name, migrations);
     let wp = Waypoint::new(config).await.expect("connect");
 
     let report = wp.migrate(None).await.expect("migrate");
@@ -134,7 +170,7 @@ async fn migrate_creates_history_table_and_applies_versioned_migrations() {
     assert_eq!(report2.migrations_applied, 0);
 
     // Verify the history table contents directly
-    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
     let mut conn = pool.get_conn().await.unwrap();
     let rows: Vec<(i32, Option<String>, String, String, bool)> = conn
         .query(
@@ -151,13 +187,12 @@ async fn migrate_creates_history_table_and_applies_versioned_migrations() {
     assert_eq!(rows[1].1.as_deref(), Some("2"));
     drop(conn);
     pool.disconnect().await.ok();
-
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn migrate_applies_repeatable_only_when_checksum_changes() {
-    let name = fresh_database("repeat").await;
+    let db = fresh_database("repeat").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(
@@ -167,7 +202,7 @@ async fn migrate_applies_repeatable_only_when_checksum_changes() {
             "CREATE OR REPLACE VIEW v AS SELECT 1 AS x;",
         )],
     );
-    let config = config_for(&name, migrations.clone());
+    let config = config_for(name, migrations.clone());
     let wp = Waypoint::new(config).await.expect("connect");
 
     let r1 = wp.migrate(None).await.expect("first apply");
@@ -183,13 +218,12 @@ async fn migrate_applies_repeatable_only_when_checksum_changes() {
     .unwrap();
     let r3 = wp.migrate(None).await.expect("third apply after change");
     assert_eq!(r3.migrations_applied, 1);
-
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn migrate_records_failure_when_sql_is_invalid() {
-    let name = fresh_database("fail").await;
+    let db = fresh_database("fail").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(
@@ -199,7 +233,7 @@ async fn migrate_records_failure_when_sql_is_invalid() {
             "CREATE TABLE oops (id INT, NOT VALID THIS SHOULD FAIL);",
         )],
     );
-    let config = config_for(&name, migrations);
+    let config = config_for(name, migrations);
     let wp = Waypoint::new(config).await.expect("connect");
     let err = wp.migrate(None).await.expect_err("should fail");
     let msg = err.to_string();
@@ -208,13 +242,13 @@ async fn migrate_records_failure_when_sql_is_invalid() {
         "expected failure to reference the script or table, got: {}",
         msg
     );
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn info_lists_pending_and_applied_states() {
     use waypoint_core::commands::info::MigrationState;
-    let name = fresh_database("info").await;
+    let db = fresh_database("info").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(
@@ -227,7 +261,7 @@ async fn info_lists_pending_and_applied_states() {
             ),
         ],
     );
-    let config = config_for(&name, migrations);
+    let config = config_for(name, migrations);
     let wp = Waypoint::new(config).await.expect("connect");
 
     // Apply only up to V1
@@ -241,20 +275,19 @@ async fn info_lists_pending_and_applied_states() {
         .collect();
     assert_eq!(by_version["1"].state, MigrationState::Applied);
     assert_eq!(by_version["2"].state, MigrationState::Pending);
-
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn validate_passes_after_migrate() {
-    let name = fresh_database("validate").await;
+    let db = fresh_database("validate").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(
         &migrations,
         &[("V1__T.sql", "CREATE TABLE t (id INT PRIMARY KEY);")],
     );
-    let config = config_for(&name, migrations.clone());
+    let config = config_for(name, migrations.clone());
     let wp = Waypoint::new(config).await.expect("connect");
     wp.migrate(None).await.expect("migrate");
 
@@ -277,17 +310,16 @@ async fn validate_passes_after_migrate() {
 
     let report2 = wp.validate().await.expect("validate after repair");
     assert!(report2.valid);
-
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn baseline_records_a_baseline_row() {
-    let name = fresh_database("baseline").await;
+    let db = fresh_database("baseline").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(&migrations, &[]);
-    let config = config_for(&name, migrations);
+    let config = config_for(name, migrations);
     let wp = Waypoint::new(config).await.expect("connect");
 
     wp.baseline(Some("5"), Some("imported existing"))
@@ -306,32 +338,31 @@ async fn baseline_records_a_baseline_row() {
     assert_eq!(infos.len(), 1);
     assert_eq!(infos[0].version.as_deref(), Some("5"));
     assert_eq!(infos[0].migration_type, "BASELINE");
-
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn schema_public_falls_back_to_current_database() {
     // When config.schema is the PG default "public", MySQL paths should fall
     // back to the connection's current database so a PG-shaped config works.
-    let name = fresh_database("publicschema").await;
+    let db = fresh_database("publicschema").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(
         &migrations,
         &[("V1__Empty.sql", "CREATE TABLE t (id INT PRIMARY KEY);")],
     );
-    let mut config = config_for(&name, migrations);
+    let mut config = config_for(name, migrations);
     config.migrations.schema = "public".to_string(); // simulate PG-default
     let wp = Waypoint::new(config).await.expect("connect");
     let r = wp.migrate(None).await.expect("migrate");
     assert_eq!(r.migrations_applied, 1);
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn clean_drops_all_objects_in_database() {
-    let name = fresh_database("clean").await;
+    let db = fresh_database("clean").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(
@@ -347,19 +378,19 @@ async fn clean_drops_all_objects_in_database() {
             ),
         ],
     );
-    let mut config = config_for(&name, migrations);
+    let mut config = config_for(name, migrations);
     config.migrations.clean_enabled = true;
     let wp = Waypoint::new(config).await.expect("connect");
     wp.migrate(None).await.expect("migrate");
 
     // Verify objects exist
-    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
     let mut conn = pool.get_conn().await.unwrap();
     let before: Vec<String> = conn
         .exec(
             "SELECT TABLE_NAME FROM information_schema.TABLES \
              WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
-            (name.as_str(),),
+            (name,),
         )
         .await
         .unwrap();
@@ -375,12 +406,12 @@ async fn clean_drops_all_objects_in_database() {
     assert!(dropped.iter().any(|d| d.contains("v")));
 
     // Verify everything's gone
-    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
     let mut conn = pool.get_conn().await.unwrap();
     let after: Vec<String> = conn
         .exec(
             "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?",
-            (name.as_str(),),
+            (name,),
         )
         .await
         .unwrap();
@@ -391,14 +422,13 @@ async fn clean_drops_all_objects_in_database() {
     );
     drop(conn);
     pool.disconnect().await.ok();
-
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn snapshot_captures_tables_and_views_via_show_create() {
     use waypoint_core::commands::snapshot::SnapshotConfig;
-    let name = fresh_database("snap").await;
+    let db = fresh_database("snap").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(
@@ -414,7 +444,7 @@ async fn snapshot_captures_tables_and_views_via_show_create() {
             ),
         ],
     );
-    let config = config_for(&name, migrations);
+    let config = config_for(name, migrations);
     let wp = Waypoint::new(config).await.expect("connect");
     wp.migrate(None).await.expect("migrate");
 
@@ -432,14 +462,13 @@ async fn snapshot_captures_tables_and_views_via_show_create() {
     assert!(snapshot_sql.contains("CREATE TABLE"));
     assert!(snapshot_sql.contains("`thing`"));
     assert!(snapshot_sql.contains("thing_names"));
-
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn restore_recreates_schema_from_snapshot() {
     use waypoint_core::commands::snapshot::SnapshotConfig;
-    let name = fresh_database("restore").await;
+    let db = fresh_database("restore").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(
@@ -449,7 +478,7 @@ async fn restore_recreates_schema_from_snapshot() {
             "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255));",
         )],
     );
-    let mut config = config_for(&name, migrations);
+    let mut config = config_for(name, migrations);
     config.migrations.clean_enabled = true;
     let wp = Waypoint::new(config).await.expect("connect");
     wp.migrate(None).await.expect("migrate");
@@ -466,12 +495,12 @@ async fn restore_recreates_schema_from_snapshot() {
     wp.clean(true).await.expect("clean");
 
     // Verify it's gone
-    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
     let mut conn = pool.get_conn().await.unwrap();
     let before: Vec<String> = conn
         .exec(
             "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?",
-            (name.as_str(),),
+            (name,),
         )
         .await
         .unwrap();
@@ -485,29 +514,28 @@ async fn restore_recreates_schema_from_snapshot() {
         .expect("restore");
 
     // users table should be back
-    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
     let mut conn = pool.get_conn().await.unwrap();
     let after: Vec<String> = conn
         .exec(
             "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?",
-            (name.as_str(),),
+            (name,),
         )
         .await
         .unwrap();
     assert!(after.contains(&"users".to_string()));
     drop(conn);
     pool.disconnect().await.ok();
-
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn clean_refuses_when_disabled_unless_force() {
-    let name = fresh_database("cleandis").await;
+    let db = fresh_database("cleandis").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(&migrations, &[]);
-    let mut config = config_for(&name, migrations);
+    let mut config = config_for(name, migrations);
     config.migrations.clean_enabled = false;
     let wp = Waypoint::new(config).await.expect("connect");
 
@@ -517,12 +545,12 @@ async fn clean_refuses_when_disabled_unless_force() {
 
     // allow_clean=true overrides
     let _ = wp.clean(true).await.expect("clean with allow");
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn migrate_runs_lifecycle_hooks() {
-    let name = fresh_database("hooks").await;
+    let db = fresh_database("hooks").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     std::fs::create_dir_all(&migrations).unwrap();
@@ -559,7 +587,7 @@ async fn migrate_runs_lifecycle_hooks() {
     )
     .unwrap();
 
-    let config = config_for(&name, migrations);
+    let config = config_for(name, migrations);
     let wp = Waypoint::new(config).await.expect("connect");
 
     let report = wp.migrate(None).await.expect("migrate with hooks");
@@ -568,39 +596,16 @@ async fn migrate_runs_lifecycle_hooks() {
     assert_eq!(report.hooks_executed, 6);
 
     // Verify marker rows
-    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
     let mut conn = pool.get_conn().await.unwrap();
     let rows: Vec<(String, i32)> = conn
         .query("SELECT phase, n FROM _wp_hook_marker ORDER BY phase, n")
         .await
         .unwrap();
-    let phase_counts: std::collections::HashMap<&str, i64> = {
-        let mut m: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
-        for (p, _) in &rows {
-            *m.entry(p.as_str()).or_insert(0) += 1;
-        }
-        // Move into HashMap<&'static str, _>-equivalent for assertions
-        let mut out: std::collections::HashMap<&'static str, i64> =
-            std::collections::HashMap::new();
-        for (k, v) in m.iter() {
-            match *k {
-                "before_each" => {
-                    out.insert("before_each", *v);
-                }
-                "after_each" => {
-                    out.insert("after_each", *v);
-                }
-                "after" => {
-                    out.insert("after", *v);
-                }
-                _ => {}
-            }
-        }
-        out
-    };
-    assert_eq!(phase_counts.get("before_each").copied(), Some(2));
-    assert_eq!(phase_counts.get("after_each").copied(), Some(2));
-    assert_eq!(phase_counts.get("after").copied(), Some(1));
+    let count = |phase: &str| rows.iter().filter(|(p, _)| p == phase).count();
+    assert_eq!(count("before_each"), 2);
+    assert_eq!(count("after_each"), 2);
+    assert_eq!(count("after"), 1);
     drop(conn);
     pool.disconnect().await.ok();
 
@@ -609,13 +614,12 @@ async fn migrate_runs_lifecycle_hooks() {
     let report2 = wp.migrate(None).await.expect("migrate no-op");
     assert_eq!(report2.migrations_applied, 0);
     assert_eq!(report2.hooks_executed, 0);
-
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn simulate_runs_pending_migrations_in_throwaway_db() {
-    let name = fresh_database("sim").await;
+    let db = fresh_database("sim").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(
@@ -628,7 +632,7 @@ async fn simulate_runs_pending_migrations_in_throwaway_db() {
             ),
         ],
     );
-    let config = config_for(&name, migrations);
+    let config = config_for(name, migrations);
     let wp = Waypoint::new(config).await.expect("connect");
 
     // Apply V1 to the source DB so V2 has something to ALTER
@@ -657,13 +661,12 @@ async fn simulate_runs_pending_migrations_in_throwaway_db() {
     );
     drop(conn);
     pool.disconnect().await.ok();
-
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn simulate_reports_sql_errors_without_failing() {
-    let name = fresh_database("simerr").await;
+    let db = fresh_database("simerr").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(
@@ -673,24 +676,23 @@ async fn simulate_reports_sql_errors_without_failing() {
             "CREATE TABLE t (id INT, INVALID GIBBERISH HERE);",
         )],
     );
-    let config = config_for(&name, migrations);
+    let config = config_for(name, migrations);
     let wp = Waypoint::new(config).await.expect("connect");
 
     let report = wp.simulate().await.expect("simulate ran");
     assert!(!report.passed);
     assert_eq!(report.errors.len(), 1);
     assert_eq!(report.errors[0].script, "V1__Bad.sql");
-
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn preflight_runs_mysql_checks() {
-    let name = fresh_database("preflight").await;
+    let db = fresh_database("preflight").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(&migrations, &[]);
-    let config = config_for(&name, migrations);
+    let config = config_for(name, migrations);
     let wp = Waypoint::new(config).await.expect("connect");
 
     let report = wp.preflight().await.expect("preflight");
@@ -707,14 +709,13 @@ async fn preflight_runs_mysql_checks() {
     assert!(names.contains(&"Replication Lag"));
     assert!(names.contains(&"Database Size"));
     assert!(names.contains(&"Lock Contention"));
-
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn undo_with_manual_u_file_reverts_table() {
     use waypoint_core::commands::undo::UndoTarget;
-    let name = fresh_database("undo").await;
+    let db = fresh_database("undo").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     write_migrations(
@@ -724,18 +725,18 @@ async fn undo_with_manual_u_file_reverts_table() {
             ("U1__Drop.sql", "DROP TABLE t;"),
         ],
     );
-    let config = config_for(&name, migrations);
+    let config = config_for(name, migrations);
     let wp = Waypoint::new(config).await.expect("connect");
     wp.migrate(None).await.expect("migrate");
 
     // Confirm t exists
-    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
     let mut conn = pool.get_conn().await.unwrap();
     let before: Vec<String> = conn
         .exec(
             "SELECT TABLE_NAME FROM information_schema.TABLES \
              WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 't'",
-            (name.as_str(),),
+            (name,),
         )
         .await
         .unwrap();
@@ -750,13 +751,13 @@ async fn undo_with_manual_u_file_reverts_table() {
     assert!(!report.details[0].auto_reversal); // manual U-file
 
     // t should be gone
-    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
     let mut conn = pool.get_conn().await.unwrap();
     let after: Vec<String> = conn
         .exec(
             "SELECT TABLE_NAME FROM information_schema.TABLES \
              WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 't'",
-            (name.as_str(),),
+            (name,),
         )
         .await
         .unwrap();
@@ -776,14 +777,13 @@ async fn undo_with_manual_u_file_reverts_table() {
     assert_eq!(history_rows[1].1.as_deref(), Some("1"));
     drop(conn);
     pool.disconnect().await.ok();
-
-    drop_database(&name).await;
 }
 
 #[tokio::test]
 async fn undo_without_u_file_errors_with_undo_missing() {
     use waypoint_core::commands::undo::UndoTarget;
-    let name = fresh_database("undomiss").await;
+    let db = fresh_database("undomiss").await;
+    let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
     // V1 with no corresponding U1 file
@@ -791,7 +791,7 @@ async fn undo_without_u_file_errors_with_undo_missing() {
         &migrations,
         &[("V1__Create.sql", "CREATE TABLE t (id INT PRIMARY KEY);")],
     );
-    let config = config_for(&name, migrations);
+    let config = config_for(name, migrations);
     let wp = Waypoint::new(config).await.expect("connect");
     wp.migrate(None).await.expect("migrate");
 
@@ -802,6 +802,4 @@ async fn undo_without_u_file_errors_with_undo_missing() {
         "expected UndoMissing-style error, got: {}",
         msg
     );
-
-    drop_database(&name).await;
 }

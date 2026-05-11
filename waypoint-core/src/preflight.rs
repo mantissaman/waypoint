@@ -56,12 +56,20 @@ pub struct PreflightReport {
 }
 
 /// Configuration for pre-flight checks.
+///
+/// Replication-lag thresholds are engine-specific because the natural unit
+/// differs: PostgreSQL measures WAL lag in bytes, MySQL measures replica lag
+/// in seconds. Configure whichever applies to your deployment.
 #[derive(Debug, Clone)]
 pub struct PreflightConfig {
     /// Whether pre-flight checks are enabled before migrations.
     pub enabled: bool,
-    /// Maximum acceptable replication lag in megabytes before warning.
+    /// PostgreSQL only: maximum acceptable WAL replication lag in megabytes
+    /// before warning (compared against `pg_wal_lsn_diff`).
     pub max_replication_lag_mb: i64,
+    /// MySQL only: maximum acceptable replica lag in seconds before warning
+    /// (compared against `Seconds_Behind_Source` from `SHOW REPLICA STATUS`).
+    pub max_replication_lag_secs: i64,
     /// Threshold in seconds for detecting long-running queries.
     pub long_query_threshold_secs: i64,
 }
@@ -71,6 +79,7 @@ impl Default for PreflightConfig {
         Self {
             enabled: true,
             max_replication_lag_mb: 100,
+            max_replication_lag_secs: 30,
             long_query_threshold_secs: 300,
         }
     }
@@ -307,7 +316,7 @@ async fn run_preflight_mysql(
     checks.push(check_read_only_mysql(client).await);
     checks.push(check_active_connections_mysql(client).await);
     checks.push(check_long_running_queries_mysql(client, config.long_query_threshold_secs).await);
-    checks.push(check_replication_lag_mysql(client, config.max_replication_lag_mb).await);
+    checks.push(check_replication_lag_mysql(client, config.max_replication_lag_secs).await);
     checks.push(check_database_size_mysql(client).await);
     checks.push(check_lock_contention_mysql(client).await);
 
@@ -466,12 +475,8 @@ async fn check_long_running_queries_mysql(
 }
 
 #[cfg(feature = "mysql")]
-async fn check_replication_lag_mysql(client: &DbClient, max_lag_mb: i64) -> PreflightCheck {
+async fn check_replication_lag_mysql(client: &DbClient, max_lag_secs: i64) -> PreflightCheck {
     use mysql_async::prelude::*;
-    // We measure lag in seconds (MySQL's natural unit) and apply the configured
-    // limit by treating MB as an approximate seconds value — caller can tune
-    // max_replication_lag_mb to taste. We don't pretend the units match PG.
-    let max_lag_secs = max_lag_mb;
     let pool = client.as_mysql().expect("mysql pool");
     let mut conn = match pool.get_conn().await {
         Ok(c) => c,

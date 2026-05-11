@@ -318,6 +318,7 @@ struct TomlSnapshotConfig {
 struct TomlPreflightConfig {
     enabled: Option<bool>,
     max_replication_lag_mb: Option<i64>,
+    max_replication_lag_secs: Option<i64>,
     long_query_threshold_secs: Option<i64>,
 }
 
@@ -535,6 +536,7 @@ impl WaypointConfig {
         if let Some(p) = toml.preflight {
             apply_option!(p.enabled => self.preflight.enabled);
             apply_option!(p.max_replication_lag_mb => self.preflight.max_replication_lag_mb);
+            apply_option!(p.max_replication_lag_secs => self.preflight.max_replication_lag_secs);
             apply_option!(p.long_query_threshold_secs => self.preflight.long_query_threshold_secs);
         }
 

@@ -286,10 +286,11 @@ impl DbClient {
     /// Run one or more `;`-separated SQL statements without an explicit transaction.
     ///
     /// On PostgreSQL this is a single `batch_execute` call. On MySQL it splits
-    /// the batch into individual statements (mysql_async's underlying protocol
-    /// doesn't accept multiple statements unless the connection is built with
-    /// `CLIENT_MULTI_STATEMENTS`, which we deliberately avoid). Returns elapsed
-    /// time in milliseconds.
+    /// the batch into individual statements via
+    /// [`crate::sql_parser::split_mysql_statements`] (mysql_async's underlying
+    /// protocol doesn't accept multiple statements unless the connection is
+    /// built with `CLIENT_MULTI_STATEMENTS`, which we deliberately avoid).
+    /// Returns elapsed time in milliseconds.
     pub async fn execute_raw(&self, sql: &str) -> Result<i32> {
         match self {
             #[cfg(feature = "postgres")]
@@ -299,7 +300,7 @@ impl DbClient {
                 use mysql_async::prelude::*;
                 let start = std::time::Instant::now();
                 let mut conn = pool.get_conn().await?;
-                for stmt in split_simple_statements(sql) {
+                for stmt in crate::sql_parser::split_mysql_statements(sql) {
                     conn.query_drop(&stmt).await?;
                 }
                 Ok(start.elapsed().as_millis() as i32)
@@ -323,52 +324,6 @@ impl DbClient {
             DbClient::Mysql(_) => self.execute_raw(sql).await,
         }
     }
-}
-
-/// Split a `;`-delimited SQL batch into individual statements for engines that
-/// don't accept multi-statement batches over the wire (currently MySQL).
-///
-/// This is a deliberately simple splitter — it does NOT handle dollar-quoting
-/// (PG-only), `DELIMITER //` blocks, or string-literal `;` characters with full
-/// fidelity. For Phase 1 it covers the history-table DDL we generate; richer
-/// MySQL splitting (DELIMITER awareness for stored procedures) lives in
-/// [`crate::sql_parser`] and will be plumbed in when migrate is ported.
-#[cfg(feature = "mysql")]
-fn split_simple_statements(sql: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_backtick = false;
-    for c in sql.chars() {
-        match c {
-            '\'' if !in_double && !in_backtick => {
-                in_single = !in_single;
-                buf.push(c);
-            }
-            '"' if !in_single && !in_backtick => {
-                in_double = !in_double;
-                buf.push(c);
-            }
-            '`' if !in_single && !in_double => {
-                in_backtick = !in_backtick;
-                buf.push(c);
-            }
-            ';' if !in_single && !in_double && !in_backtick => {
-                let stmt = buf.trim();
-                if !stmt.is_empty() {
-                    out.push(stmt.to_string());
-                }
-                buf.clear();
-            }
-            _ => buf.push(c),
-        }
-    }
-    let tail = buf.trim();
-    if !tail.is_empty() {
-        out.push(tail.to_string());
-    }
-    out
 }
 
 /// Compute the MySQL named-lock key for a given history table name.

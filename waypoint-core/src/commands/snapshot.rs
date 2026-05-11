@@ -453,7 +453,7 @@ async fn execute_restore_mysql(
     // each terminated with `;`. We use a MySQL-aware splitter that respects
     // backtick-quoted identifiers and string literals.
     let mut objects_restored = 0;
-    for stmt in split_mysql_statements(&sql) {
+    for stmt in crate::sql_parser::split_mysql_statements(&sql) {
         let trimmed = stmt.trim();
         if trimmed.is_empty() {
             continue;
@@ -478,86 +478,6 @@ async fn execute_restore_mysql(
         snapshot_id: snapshot_id.to_string(),
         objects_restored,
     })
-}
-
-/// MySQL-aware `;`-delimited statement splitter. Respects single-quoted and
-/// double-quoted string literals, backtick-quoted identifiers, single-line
-/// `--` comments, and `/* ... */` block comments.
-#[cfg(feature = "mysql")]
-fn split_mysql_statements(sql: &str) -> Vec<String> {
-    let bytes = sql.as_bytes();
-    let len = bytes.len();
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut i = 0;
-    while i < len {
-        let c = bytes[i];
-        // Line comment
-        if c == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        // Block comment
-        if c == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
-            }
-            i = (i + 2).min(len);
-            continue;
-        }
-        // Single-quoted string
-        if c == b'\'' {
-            i += 1;
-            while i < len && bytes[i] != b'\'' {
-                if bytes[i] == b'\\' && i + 1 < len {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            i += 1;
-            continue;
-        }
-        // Double-quoted string
-        if c == b'"' {
-            i += 1;
-            while i < len && bytes[i] != b'"' {
-                if bytes[i] == b'\\' && i + 1 < len {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            i += 1;
-            continue;
-        }
-        // Backtick-quoted identifier
-        if c == b'`' {
-            i += 1;
-            while i < len && bytes[i] != b'`' {
-                i += 1;
-            }
-            i += 1;
-            continue;
-        }
-        // Statement terminator
-        if c == b';' {
-            out.push(sql[start..i].to_string());
-            i += 1;
-            start = i;
-            continue;
-        }
-        i += 1;
-    }
-    // Trailing chunk if any
-    let tail = sql[start..].trim();
-    if !tail.is_empty() {
-        out.push(tail.to_string());
-    }
-    out
 }
 
 fn prune_snapshots(dir: &PathBuf, max: usize) -> Result<()> {

@@ -291,11 +291,15 @@ async fn execute_inner_mysql(client: &DbClient, config: &WaypointConfig) -> Resu
         dropped.push(format!("Event: {}.{}", schema, name));
     }
 
-    // Restore FK checks regardless of whether anything failed above. (Errors
-    // above propagate via `?` and skip this — that's fine because the
-    // connection is short-lived; if the user runs clean again the session
-    // resets.)
-    conn.query_drop("SET FOREIGN_KEY_CHECKS = 1").await.ok();
+    // Restore FK checks. Errors above propagate via `?` and skip this, but
+    // that's safe because the connection is short-lived (it returns to the
+    // pool when `conn` is dropped and the next checkout starts fresh).
+    if let Err(e) = conn.query_drop("SET FOREIGN_KEY_CHECKS = 1").await {
+        log::warn!(
+            "Failed to restore FOREIGN_KEY_CHECKS=1 on clean conn: {}",
+            e
+        );
+    }
 
     log::warn!(
         "Clean completed; database={}, objects_dropped={}",

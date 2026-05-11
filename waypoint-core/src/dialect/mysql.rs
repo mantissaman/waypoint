@@ -53,23 +53,6 @@ CREATE INDEX {version_idx} ON {fq} (version);
         )
     }
 
-    fn placeholder(&self, _n: usize) -> String {
-        "?".to_string()
-    }
-
-    fn statement_timeout_sql(&self, secs: u32) -> Option<String> {
-        if secs == 0 {
-            None
-        } else {
-            // MAX_EXECUTION_TIME is in milliseconds and applies to SELECT only.
-            // It's the closest equivalent we have at the session level.
-            Some(format!(
-                "SET SESSION MAX_EXECUTION_TIME = {}",
-                (secs as u64) * 1000
-            ))
-        }
-    }
-
     fn supports_transactional_ddl(&self) -> bool {
         false
     }
@@ -84,23 +67,6 @@ mod tests {
         let d = MysqlDialect;
         assert_eq!(d.quote_ident("users"), "`users`");
         assert_eq!(d.quote_ident("my`table"), "`my``table`");
-    }
-
-    #[test]
-    fn placeholder_is_question_mark_regardless_of_index() {
-        let d = MysqlDialect;
-        assert_eq!(d.placeholder(1), "?");
-        assert_eq!(d.placeholder(7), "?");
-    }
-
-    #[test]
-    fn statement_timeout_uses_milliseconds() {
-        let d = MysqlDialect;
-        assert_eq!(
-            d.statement_timeout_sql(30),
-            Some("SET SESSION MAX_EXECUTION_TIME = 30000".into())
-        );
-        assert_eq!(d.statement_timeout_sql(0), None);
     }
 
     #[test]

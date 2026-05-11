@@ -66,14 +66,6 @@ pub trait DatabaseDialect: Send + Sync {
     /// Doubles any embedded quote character to escape it.
     fn quote_ident(&self, name: &str) -> String;
 
-    /// Quote a string literal for safe inclusion in dynamic SQL.
-    ///
-    /// Used in places where parameter binding is unavailable (e.g. statements that
-    /// can't run inside a prepared statement). Doubles single quotes.
-    fn quote_literal(&self, value: &str) -> String {
-        format!("'{}'", value.replace('\'', "''"))
-    }
-
     /// Produce a fully-qualified table reference (`schema.table`).
     ///
     /// In MySQL the "schema" is the database; in PostgreSQL it's a schema namespace.
@@ -93,32 +85,13 @@ pub trait DatabaseDialect: Send + Sync {
     /// Both store the same logical columns.
     fn history_table_ddl(&self, schema: &str, table: &str) -> String;
 
-    /// SQL placeholder syntax for the `n`-th parameter (1-indexed).
-    ///
-    /// PostgreSQL: `$1`, `$2`. MySQL: `?` (unindexed).
-    fn placeholder(&self, n: usize) -> String;
-
-    /// Statement to set the per-connection statement timeout in seconds.
-    ///
-    /// PostgreSQL: `SET statement_timeout = '<n>s'`.
-    /// MySQL: `SET SESSION MAX_EXECUTION_TIME = <n_ms>` (millisecond units, SELECT-only).
-    /// Returns `None` when the engine has no equivalent at this granularity.
-    fn statement_timeout_sql(&self, secs: u32) -> Option<String>;
-
     /// Whether the engine supports atomic rollback of DDL inside a transaction.
     ///
     /// PostgreSQL: `true`. MySQL: `false` (most DDL implicitly commits).
-    /// Used to gate `--transaction` batch mode and `ensure`-guards-in-transaction.
+    /// Used to gate `--transaction` batch mode — when this returns `false`,
+    /// callers should refuse the `batch_transaction` config or return a clear
+    /// error rather than silently no-op.
     fn supports_transactional_ddl(&self) -> bool;
-
-    /// Whether the engine supports advisory locking with the semantics Waypoint
-    /// expects (session-scoped, mutually exclusive, keyed by an integer).
-    ///
-    /// PostgreSQL: `pg_advisory_lock`. MySQL: `GET_LOCK` (named, session-scoped).
-    /// Both are usable; the difference is the key type (i64 vs string).
-    fn supports_advisory_locks(&self) -> bool {
-        true
-    }
 }
 
 /// Construct the dialect for a given kind. Returns an error if the corresponding

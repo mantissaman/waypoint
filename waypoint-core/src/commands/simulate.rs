@@ -309,9 +309,12 @@ async fn run_simulation_mysql(
         }
     }
 
-    // Views: SHOW CREATE VIEW returns DDL with the schema baked in. Rewriting
-    // it reliably is tricky, so we omit views in simulation. Migrations that
-    // depend on views via SELECT will hit a clear error.
+    // TODO(mysql-views): SHOW CREATE VIEW returns DDL with the source schema
+    // baked into qualified refs. Rewriting it reliably requires real SQL
+    // parsing (not regex). For now we omit views from simulation replication
+    // — migrations that depend on views via SELECT will hit a clear error.
+    // When MySQL schema introspection lands this should consume the same
+    // structural representation as diff/drift.
 
     // Get pending migrations.
     let resolved = scan_migrations(&config.migrations.locations)?;

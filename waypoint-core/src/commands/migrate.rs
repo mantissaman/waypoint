@@ -1355,6 +1355,16 @@ pub async fn execute_mysql_with_options(
     target_version: Option<&str>,
     _force: bool,
 ) -> Result<MigrateReport> {
+    // Reject batch-transaction mode on engines that don't support
+    // transactional DDL — better to fail loudly than silently no-op.
+    if config.migrations.batch_transaction && !client.dialect().supports_transactional_ddl() {
+        return Err(WaypointError::ConfigError(format!(
+            "batch_transaction is not supported on {} — DDL is not transactional on this engine. \
+             Remove `batch_transaction = true` or `--transaction` to proceed.",
+            client.dialect_kind().name()
+        )));
+    }
+
     let table = &config.migrations.table;
 
     client.acquire_lock(table).await?;
@@ -1505,38 +1515,35 @@ async fn run_migrate_mysql(
 
     // beforeMigrate hooks (only when there's actually pending work).
     if has_pending {
-        let hook_placeholders = build_placeholders(
+        let placeholders = build_placeholders(
             &config.placeholders,
             &schema,
             &db_user,
             &db_name,
             "beforeMigrate",
         );
-        let (count, ms) = hooks::run_hooks_db(
+        fire_hooks(
             client,
             &all_hooks,
             &HookType::BeforeMigrate,
-            &hook_placeholders,
+            &placeholders,
+            &mut report,
         )
         .await?;
-        report.hooks_executed += count;
-        report.hooks_time_ms += ms;
     }
 
     for m in sorted_versioned {
         let placeholders =
             build_placeholders(&config.placeholders, &schema, &db_user, &db_name, &m.script);
 
-        // beforeEachMigrate hooks fire before each individual migration.
-        let (count, ms) = hooks::run_hooks_db(
+        fire_hooks(
             client,
             &all_hooks,
             &HookType::BeforeEachMigrate,
             &placeholders,
+            &mut report,
         )
         .await?;
-        report.hooks_executed += count;
-        report.hooks_time_ms += ms;
 
         let elapsed =
             apply_one_mysql(client, m, &schema, table, &installed_by, &placeholders).await?;
@@ -1549,31 +1556,28 @@ async fn run_migrate_mysql(
             execution_time_ms: elapsed,
         });
 
-        // afterEachMigrate hooks fire after each individual migration.
-        let (count, ms) = hooks::run_hooks_db(
+        fire_hooks(
             client,
             &all_hooks,
             &HookType::AfterEachMigrate,
             &placeholders,
+            &mut report,
         )
         .await?;
-        report.hooks_executed += count;
-        report.hooks_time_ms += ms;
     }
 
     for m in pending_repeatables {
         let placeholders =
             build_placeholders(&config.placeholders, &schema, &db_user, &db_name, &m.script);
 
-        let (count, ms) = hooks::run_hooks_db(
+        fire_hooks(
             client,
             &all_hooks,
             &HookType::BeforeEachMigrate,
             &placeholders,
+            &mut report,
         )
         .await?;
-        report.hooks_executed += count;
-        report.hooks_time_ms += ms;
 
         let elapsed =
             apply_one_mysql(client, m, &schema, table, &installed_by, &placeholders).await?;
@@ -1586,38 +1590,50 @@ async fn run_migrate_mysql(
             execution_time_ms: elapsed,
         });
 
-        let (count, ms) = hooks::run_hooks_db(
+        fire_hooks(
             client,
             &all_hooks,
             &HookType::AfterEachMigrate,
             &placeholders,
+            &mut report,
         )
         .await?;
-        report.hooks_executed += count;
-        report.hooks_time_ms += ms;
     }
 
     // afterMigrate hooks (only when there was actually pending work).
     if has_pending {
-        let hook_placeholders = build_placeholders(
+        let placeholders = build_placeholders(
             &config.placeholders,
             &schema,
             &db_user,
             &db_name,
             "afterMigrate",
         );
-        let (count, ms) = hooks::run_hooks_db(
+        fire_hooks(
             client,
             &all_hooks,
             &HookType::AfterMigrate,
-            &hook_placeholders,
+            &placeholders,
+            &mut report,
         )
         .await?;
-        report.hooks_executed += count;
-        report.hooks_time_ms += ms;
     }
 
     Ok(report)
+}
+
+/// Run all hooks of `phase` and fold the result into `report`.
+async fn fire_hooks(
+    client: &DbClient,
+    all_hooks: &[ResolvedHook],
+    phase: &HookType,
+    placeholders: &HashMap<String, String>,
+    report: &mut MigrateReport,
+) -> Result<()> {
+    let (count, ms) = hooks::run_hooks_db(client, all_hooks, phase, placeholders).await?;
+    report.hooks_executed += count;
+    report.hooks_time_ms += ms;
+    Ok(())
 }
 
 async fn apply_one_mysql(

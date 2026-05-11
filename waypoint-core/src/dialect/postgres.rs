@@ -40,18 +40,6 @@ CREATE INDEX IF NOT EXISTS {version_idx} ON {fq} (version);
         )
     }
 
-    fn placeholder(&self, n: usize) -> String {
-        format!("${}", n)
-    }
-
-    fn statement_timeout_sql(&self, secs: u32) -> Option<String> {
-        if secs == 0 {
-            None
-        } else {
-            Some(format!("SET statement_timeout = '{}s'", secs))
-        }
-    }
-
     fn supports_transactional_ddl(&self) -> bool {
         true
     }
@@ -66,23 +54,6 @@ mod tests {
         let d = PostgresDialect;
         assert_eq!(d.quote_ident("users"), r#""users""#);
         assert_eq!(d.quote_ident(r#"my"table"#), r#""my""table""#);
-    }
-
-    #[test]
-    fn placeholder_is_dollar_indexed() {
-        let d = PostgresDialect;
-        assert_eq!(d.placeholder(1), "$1");
-        assert_eq!(d.placeholder(7), "$7");
-    }
-
-    #[test]
-    fn statement_timeout_uses_seconds() {
-        let d = PostgresDialect;
-        assert_eq!(
-            d.statement_timeout_sql(30),
-            Some("SET statement_timeout = '30s'".into())
-        );
-        assert_eq!(d.statement_timeout_sql(0), None);
     }
 
     #[test]
