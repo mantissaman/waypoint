@@ -2,11 +2,11 @@
 name = "waypoint-core"
 version = "0.3.4"
 edition = "2021"
-description = "Lightweight, Flyway-compatible PostgreSQL migration library"
+description = "Lightweight, Flyway-compatible SQL migration library for PostgreSQL and MySQL"
 license = "MIT"
 repository = "https://github.com/tensorbee/waypoint"
 homepage = "https://github.com/tensorbee/waypoint"
-keywords = ["database", "migration", "postgresql", "flyway", "sql"]
+keywords = ["database", "migration", "postgresql", "mysql", "flyway"]
 categories = ["database"]
 readme = "../README.md"
 documentation = "https://docs.rs/waypoint-core"
