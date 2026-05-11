@@ -50,9 +50,9 @@ export DB_URL_MYSQL="mysql://root:mysql@localhost:3306/waypoint_test"
 ```
 
 Commands work the same on both engines — just point `--url` at the right one.
-Most analysis commands (`safety`, `advise`, `diff`, `drift`, guards) are
-PostgreSQL-only for now; see [CLAUDE.md](../CLAUDE.md) for the per-command
-status table.
+Analysis commands (`safety`, `advise`, `diff`, `drift`, guards) work on both
+PostgreSQL and MySQL; see [CLAUDE.md](../CLAUDE.md) for the per-command
+status table and any engine-specific caveats.
 
 ### Running the MySQL integration test suite
 

@@ -98,10 +98,15 @@ async fn upgrade_history_table_db(client: &DbClient, schema: &str, table: &str) 
 /// Whether an error message indicates a benign "duplicate index/key name"
 /// that occurs when re-running idempotent CREATE INDEX statements on MySQL.
 fn is_benign_index_dup(e: &WaypointError) -> bool {
+    // MySQL <8.0.29 lacks `CREATE INDEX IF NOT EXISTS` and emits ER_DUP_KEYNAME
+    // (error 1061, message "Duplicate key name '...'") when an index already
+    // exists. The CREATE TABLE / CREATE INDEX statements in our history DDL
+    // are otherwise idempotent (IF NOT EXISTS on the table, MySQL 8.0.29+
+    // accepts it on the index), so this is the only benign error we want to
+    // swallow. Avoid matching a broader "already exists" substring — that
+    // would also accept genuinely-broken cases like a table-creation race.
     let msg = e.to_string().to_lowercase();
-    msg.contains("er_dup_keyname")
-        || msg.contains("duplicate key name")
-        || msg.contains("already exists")
+    msg.contains("er_dup_keyname") || msg.contains("duplicate key name")
 }
 
 /// Check if the history table exists (dialect-aware).

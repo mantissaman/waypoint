@@ -59,9 +59,9 @@ Cargo workspace with two crates:
 | `safety.rs` | Shared safety types (`LockLevel`, `SafetyVerdict`, `SafetyReport`, `SafetyConfig`) + `analyze_migration_db` dispatcher. Engine analysers live under `engines/{postgres,mysql}/safety.rs` |
 | `advisor.rs` | Shared advisor types (`Advisory`, `AdvisorReport`, `AdvisorConfig`) + `analyze_db` dispatcher + `generate_fix_sql`. Engine rule sets live under `engines/{postgres,mysql}/advisor.rs` (A001-A010 / M001-M005) |
 | `sql_parser.rs` | Regex-based DDL extraction (`DdlOperation` enum), `split_statements()` |
-| `schema.rs` | PostgreSQL introspection via `information_schema`/`pg_catalog`, diff, DDL generation. PostgreSQL-only for now |
+| `schema.rs` | Schema introspection, diff, and DDL generation. PG path uses `information_schema`/`pg_catalog` and emits PG-flavoured DDL; MySQL path uses `information_schema` + `SHOW CREATE` and emits MySQL-flavoured DDL via `generate_ddl_mysql` |
 | `dependency.rs` | Migration dependency graph, topological sort (Kahn's algorithm) |
-| `preflight.rs` | Pre-migration health checks (recovery mode, replication lag, locks, etc.). PostgreSQL-only for now |
+| `preflight.rs` | Pre-migration health checks. PG checks (recovery mode, replication lag MB, locks, etc.) and MySQL checks (read-only, processlist, replica lag secs, etc.) co-located; dispatcher is `run_preflight_db` |
 | `multi.rs` | Multi-database orchestration with dependency ordering |
 
 ### Commands (waypoint-core/src/commands/)
@@ -108,20 +108,20 @@ No-DB commands (pure file analysis): `lint`, `changelog`, `check_conflicts` — 
 
 - **Config resolution**: CLI > env vars > TOML > defaults (see `config.rs` `load()`)
 - **Engine dispatch**: `Waypoint::new` auto-detects the engine from `config.connection_string()`'s URL scheme. Each public method on `Waypoint` either uses the dialect-aware `execute_db(&DbClient, ...)` path or routes via `client.dialect_kind()` to the right backend impl
-- **Legacy + dialect-aware command pairs**: Most ported commands keep an `execute(&Client, ...)` PG-only entry alongside a new `execute_db(&DbClient, ...)` dialect-aware entry. The legacy path serves internal callers in `multi.rs`, `explain.rs`, and the PG-specific helpers in `migrate.rs`. Removing the legacy path is deferred until every command is dialect-aware
+- **Legacy + dialect-aware command pairs**: Every command has a dialect-aware `execute_db(&DbClient, ...)` entry, used by `lib.rs` and `multi.rs`. A handful of commands still keep a legacy `execute(&Client, ...)` PG-only entry — these are now only consumed by `engines/postgres/migrate.rs` (which calls `validate::execute`) and by `commands/explain.rs` (which calls `info::execute`). Most other `execute(&Client, ...)` entries are unused dead code that we keep for back-compat with any downstream library users; deleting them is a follow-on cleanup gated on a semver bump
 - **Global CLI flags**: `--json`, `--dry-run`, `--quiet`, `--verbose`, `--environment`, `--skip-preflight`, `--database`, `--fail-fast`, `--force`, `--simulate`, `--no-color`, `--config/-c` are `global = true` in clap — work before or after subcommand
 - **Self-update feature-gated**: `ureq`, `semver`, `flate2`, `tar` are behind `self-update` feature (default on). Build without: `cargo build --no-default-features --features postgres`
 - **Config macros**: `apply_option!` and `apply_option_some!` macros eliminate boilerplate in `config.rs`
 - **print_report! macro**: CLI uses `print_report!` macro for uniform JSON/pretty-print output
-- **Schema introspection**: PG uses `tokio::try_join!()` to parallelize 9 independent queries; N+1 pattern eliminated with JOIN. MySQL schema introspection is not yet implemented
-- **Multi-database mode**: Auto-detected when `config.multi_database.is_some()`. Uses Kahn's algorithm for dependency ordering. Currently PG-only at the routing layer; mixed-engine support is Phase 4 work
+- **Schema introspection**: PG uses `tokio::try_join!()` to parallelize 9 independent queries; N+1 pattern eliminated with JOIN. MySQL path (`schema::introspect_mysql`) issues per-area `information_schema` queries and resolves view DB-qualifiers — sequences/functions/enums come back empty (no MySQL equivalents)
+- **Multi-database mode**: Auto-detected when `config.multi_database.is_some()`. Uses Kahn's algorithm for dependency ordering; mixed-engine configs (PG + MySQL in the same `[[databases]]` list) are supported via `multi::run_migrate_for_db` which routes per-database based on `DialectKind`
 - **All reports are `Serialize`**: Every command returns a report struct that implements `serde::Serialize` for `--json` output
 - **Migration file types**: `V{ver}__desc.sql` (versioned), `R__desc.sql` (repeatable), `U{ver}__desc.sql` (undo)
 - **Directives**: `-- waypoint:env`, `-- waypoint:depends`, `-- waypoint:require`, `-- waypoint:ensure`, `-- waypoint:safety-override` parsed from SQL file headers by `directive.rs`
-- **Guards**: `require` (preconditions) and `ensure` (postconditions) use a recursive descent parser in `guard.rs`; evaluated against live DB via `information_schema`/`pg_catalog`. MySQL guards not yet wired
-- **Auto-reversals**: `reversal.rs` captures before/after schema snapshots, generates reverse DDL, stores in `reversal_sql` column; `undo.rs` falls back to stored reversals when no U file exists. PG only
-- **Safety analysis**: `safety.rs` maps DDL → PostgreSQL lock levels, queries `pg_stat_user_tables` for row counts, produces Safe/Caution/Danger verdicts; `migrate.rs` gates DANGER migrations behind `--force`. PG only
-- **MySQL non-transactional DDL caveat**: Documented and respected, not emulated. `--transaction` batch mode is not supported on MySQL. `ensure` guards (when ported in Phase 3) become verify-after rather than rollback-if-false
+- **Guards**: `require` (preconditions) and `ensure` (postconditions) use a recursive descent parser in `guard.rs`; the legacy `evaluate(&Client, ...)` path queries `information_schema`/`pg_catalog`, and the dialect-aware `evaluate_db(&DbClient, ...)` path dispatches between the PG and MySQL builtin tables (`enum_exists` rejected on MySQL — no enum type)
+- **Auto-reversals**: `reversal.rs` captures before/after schema snapshots, generates reverse DDL, stores in `reversal_sql` column; `undo.rs` falls back to stored reversals when no U file exists. PG uses `schema::generate_ddl`; MySQL uses `schema::generate_ddl_mysql` (with dependent constraint/index diffs filtered when the parent table is being dropped — MySQL has no CASCADE)
+- **Safety analysis**: shared types in `safety.rs` + dialect-aware `analyze_migration_db` dispatcher. PG analyser (`engines/postgres/safety.rs`) maps DDL → PG lock levels and queries `pg_stat_user_tables`; MySQL analyser (`engines/mysql/safety.rs`) uses worst-case ALGORITHM=COPY lock mapping and `information_schema.tables.table_rows`; `migrate.rs` gates DANGER migrations behind `--force` on PG (MySQL safety verdicts are advisory, not gating)
+- **MySQL non-transactional DDL caveat**: Documented and respected, not emulated. `--transaction` batch mode is not supported on MySQL. `ensure` guards run verify-after on MySQL (DDL has auto-committed) rather than rollback-if-false
 - **MySQL schema fallback**: `DbClient::resolve_schema(configured)` returns `configured` on PG. On MySQL, when `configured == "public"` (the PG default) it falls back to `DATABASE()` so a PG-shaped config keeps working when pointed at MySQL
 
 ## Config
