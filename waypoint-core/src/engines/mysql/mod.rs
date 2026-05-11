@@ -4,3 +4,4 @@
 //! engine-agnostic types and dispatcher live at the top level of the crate.
 
 pub mod history;
+pub mod migrate;
