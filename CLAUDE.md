@@ -48,15 +48,16 @@ Cargo workspace with two crates:
 | `migration.rs` | `ResolvedMigration`, `MigrationVersion`, filename parsing, file scanning |
 | `checksum.rs` | CRC32 checksum (line-by-line, Flyway-compatible) |
 | `placeholder.rs` | `${key}` placeholder replacement in SQL |
-| `history.rs` | Schema history table CRUD. Has legacy PG-only fns and `_db`-suffixed dialect-aware variants |
+| `history.rs` | Schema history-table dispatcher + `AppliedMigration` shared type. PG/MySQL implementations live in `engines/{postgres,mysql}/history.rs` |
 | `db.rs` | `DbClient` enum wrapping `tokio_postgres::Client` or `mysql_async::Pool`. Dialect-aware methods: `acquire_lock`, `current_user`, `current_database`, `resolve_schema`, `execute_raw`, `execute_in_transaction`. Legacy PG-only `connect_*` / `acquire_advisory_lock` fns retained |
+| `engines/` | Per-engine implementation modules. `engines/postgres/{history,migrate,advisor,safety}.rs` and `engines/mysql/{history,migrate,advisor,safety}.rs` hold the engine-specific bodies; the top-level modules expose the shared types and dialect-aware dispatchers and re-export the engine entry points for back-compat |
 | `hooks.rs` | SQL callback hooks (beforeMigrate, afterEachMigrate, etc.) |
 | `error.rs` | `WaypointError` enum (36 variants). `DatabaseError(tokio_postgres::Error)` is feature-gated; `MysqlError(mysql_async::Error)` added behind `mysql` feature |
 | `directive.rs` | Parse `-- waypoint:*` directives (env, depends, require, ensure, safety-override) |
-| `guard.rs` | Guard expression parser + evaluator (10 built-in assertion functions). PostgreSQL-only for now |
-| `reversal.rs` | Auto-reversal generation from schema diffs, storage/retrieval. PostgreSQL-only for now |
-| `safety.rs` | Lock analysis, impact estimation, safety verdicts (Safe/Caution/Danger). PostgreSQL-only for now |
-| `advisor.rs` | Schema advisory rules (A001-A010), fix SQL generation. PostgreSQL-only for now |
+| `guard.rs` | Guard expression parser + evaluator (10 built-in assertion functions). PG + MySQL builtin tables; engine paths still co-located. |
+| `reversal.rs` | Auto-reversal generation from schema diffs, storage/retrieval. PG + MySQL paths still co-located. |
+| `safety.rs` | Shared safety types (`LockLevel`, `SafetyVerdict`, `SafetyReport`, `SafetyConfig`) + `analyze_migration_db` dispatcher. Engine analysers live under `engines/{postgres,mysql}/safety.rs` |
+| `advisor.rs` | Shared advisor types (`Advisory`, `AdvisorReport`, `AdvisorConfig`) + `analyze_db` dispatcher + `generate_fix_sql`. Engine rule sets live under `engines/{postgres,mysql}/advisor.rs` (A001-A010 / M001-M005) |
 | `sql_parser.rs` | Regex-based DDL extraction (`DdlOperation` enum), `split_statements()` |
 | `schema.rs` | PostgreSQL introspection via `information_schema`/`pg_catalog`, diff, DDL generation. PostgreSQL-only for now |
 | `dependency.rs` | Migration dependency graph, topological sort (Kahn's algorithm) |
