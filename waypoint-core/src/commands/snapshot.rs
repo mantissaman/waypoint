@@ -411,13 +411,23 @@ async fn execute_snapshot_mysql(
 #[cfg(feature = "mysql")]
 fn strip_mysql_definer(create_sql: &str) -> String {
     use std::sync::LazyLock;
-    // `DEFINER=`u`@`h`` — both identifier parts are quoted with backticks
-    // (MySQL escapes backticks inside them by doubling, so [^`]* is safe).
+    // MySQL accepts three DEFINER forms:
+    //   1. `DEFINER=`user`@`host``       — backtick-quoted (default `SHOW
+    //      CREATE VIEW` output, including escaped doubled backticks: `aa``bb`)
+    //   2. `DEFINER='user'@'host'`       — single-quoted (less common from
+    //      `SHOW CREATE VIEW` but valid; hand-edited snapshots may use it)
+    //   3. `DEFINER=CURRENT_USER`        — unquoted function form (also
+    //      `CURRENT_USER()` with optional parens)
+    // We handle all three so a hand-edited snapshot doesn't slip through.
     // We also strip an optional trailing `SQL SECURITY DEFINER` since after
-    // removing the definer that clause refers to a now-absent user. Match
-    // is case-insensitive (MySQL keywords) and tolerant of extra whitespace.
-    static DEFINER_RE: LazyLock<regex_lite::Regex> =
-        LazyLock::new(|| regex_lite::Regex::new(r"(?i)\s*DEFINER\s*=\s*`[^`]*`@`[^`]*`").unwrap());
+    // removing the definer that clause refers to a now-absent user.
+    // Case-insensitive, tolerant of extra whitespace.
+    static DEFINER_RE: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+        regex_lite::Regex::new(
+            r"(?i)\s*DEFINER\s*=\s*(?:`[^`]*`@`[^`]*`|'[^']*'@'[^']*'|CURRENT_USER(?:\s*\(\s*\))?)",
+        )
+        .unwrap()
+    });
     static SECURITY_DEFINER_RE: LazyLock<regex_lite::Regex> =
         LazyLock::new(|| regex_lite::Regex::new(r"(?i)\s+SQL\s+SECURITY\s+DEFINER").unwrap());
 
@@ -614,5 +624,34 @@ mod tests_mysql_definer {
         let out = strip_mysql_definer(input);
         assert!(!out.contains("DEFINER=`u`"));
         assert!(out.contains("SQL SECURITY INVOKER"));
+    }
+
+    #[test]
+    fn strip_single_quoted_definer() {
+        // Hand-edited snapshots or tools like pt-osc may emit single-quoted
+        // user/host instead of backticks. Strip those too.
+        let input = "CREATE DEFINER='app_user'@'%' SQL SECURITY DEFINER VIEW `v` AS select 1";
+        let out = strip_mysql_definer(input);
+        assert!(!out.contains("DEFINER"));
+        assert!(!out.contains("SQL SECURITY"));
+        assert!(out.contains("VIEW `v`"));
+    }
+
+    #[test]
+    fn strip_current_user_function_form() {
+        // MySQL accepts `DEFINER=CURRENT_USER` (with or without parens) as
+        // shorthand. Defensive: strip these too.
+        let input1 = "CREATE DEFINER=CURRENT_USER VIEW `v` AS select 1";
+        assert_eq!(strip_mysql_definer(input1), "CREATE VIEW `v` AS select 1");
+        let input2 = "CREATE DEFINER=CURRENT_USER() VIEW `v` AS select 1";
+        assert_eq!(strip_mysql_definer(input2), "CREATE VIEW `v` AS select 1");
+    }
+
+    #[test]
+    fn passthrough_when_no_definer_on_table_ddl() {
+        // CREATE TABLE output never contains DEFINER. Verify strip is a no-op.
+        let input =
+            "CREATE TABLE `users` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB";
+        assert_eq!(strip_mysql_definer(input), input);
     }
 }

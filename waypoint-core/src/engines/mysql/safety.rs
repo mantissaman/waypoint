@@ -39,19 +39,55 @@ impl MysqlVersion {
 /// Query the connected MySQL server's version. Falls back to (0, 0, 0) so
 /// the rest of the safety pass stays conservative if the version query
 /// fails (in which case `supports_instant_*` returns false and we keep the
-/// worst-case lock mapping).
+/// worst-case lock mapping). Logs a warning on the fallback path so an
+/// operator who sees unexpectedly-pessimistic verdicts has a diagnostic to
+/// follow.
 async fn detect_mysql_version(client: &DbClient) -> MysqlVersion {
     let pool = match client.as_mysql() {
         Ok(p) => p,
-        Err(_) => return MysqlVersion(0, 0, 0),
+        Err(e) => {
+            log::warn!(
+                "MySQL safety: version detection skipped, client is not MySQL: {} \
+                 — falling back to conservative lock mapping",
+                e
+            );
+            return MysqlVersion(0, 0, 0);
+        }
     };
-    let Ok(mut conn) = pool.get_conn().await else {
-        return MysqlVersion(0, 0, 0);
+    let mut conn = match pool.get_conn().await {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!(
+                "MySQL safety: failed to acquire connection for version detection: {} \
+                 — falling back to conservative lock mapping",
+                e
+            );
+            return MysqlVersion(0, 0, 0);
+        }
     };
-    let row: Option<String> = conn.query_first("SELECT @@version").await.unwrap_or(None);
-    row.as_deref()
-        .and_then(MysqlVersion::parse)
-        .unwrap_or(MysqlVersion(0, 0, 0))
+    let row: Option<String> = match conn.query_first("SELECT @@version").await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!(
+                "MySQL safety: SELECT @@version failed: {} \
+                 — falling back to conservative lock mapping",
+                e
+            );
+            return MysqlVersion(0, 0, 0);
+        }
+    };
+    let parsed = row.as_deref().and_then(MysqlVersion::parse);
+    match parsed {
+        Some(v) => v,
+        None => {
+            log::warn!(
+                "MySQL safety: could not parse @@version output ({:?}) \
+                 — falling back to conservative lock mapping",
+                row
+            );
+            MysqlVersion(0, 0, 0)
+        }
+    }
 }
 
 /// Whether MySQL `version` supports `ALGORITHM=INSTANT` for ADD COLUMN.

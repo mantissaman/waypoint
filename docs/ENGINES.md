@@ -170,12 +170,19 @@ have defaults (100 MB / 30 secs); both can be set in the same
 `SHOW CREATE VIEW` on MySQL emits the view with its original `DEFINER` user
 (e.g. `DEFINER='root'@'localhost'`). If the user who runs `restore` doesn't
 have the privilege to create views as that definer, the restore of that
-view fails (recorded as a warning, not fatal — the rest of the snapshot
-still applies).
+view fails.
 
-**Mitigation:** run snapshots and restores as a user with `SUPER`/
-`SET_USER_ID` privileges, or post-process the snapshot SQL to strip the
-DEFINER clause if cross-account restores are part of your workflow.
+**Default mitigation (built in):** `[snapshots] strip_definer_mysql = true`
+(on by default) strips `DEFINER=...` and the now-redundant `SQL SECURITY
+DEFINER` from view DDL during snapshot. The view then restores as the
+current user, which is what cross-account / cross-host restores want.
+Set the flag to `false` to preserve `DEFINER` verbatim — the restoring
+user then needs `SUPER`/`SET_USER_ID` to recreate views under the original
+definer.
+
+The regex handles the three forms MySQL recognises: backtick-quoted
+(`` DEFINER=`u`@`h` ``, the default `SHOW CREATE VIEW` output), single-
+quoted (`DEFINER='u'@'h'`), and `DEFINER=CURRENT_USER` / `CURRENT_USER()`.
 
 ### 9. Cross-database FK references in views
 
