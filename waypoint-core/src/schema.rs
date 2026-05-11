@@ -1179,12 +1179,18 @@ pub fn generate_ddl_mysql(diffs: &[SchemaDiff]) -> String {
     let mut statements = Vec::new();
     for d in diffs {
         // Skip diffs whose parent table is going away in this same batch.
+        // `DROP TABLE` on MySQL drops the table's indexes/constraints/triggers
+        // along with it, and trying to drop them separately after the table is
+        // gone fails with "Table doesn't exist".
         match d {
             SchemaDiff::ColumnAdded { table, .. }
             | SchemaDiff::ColumnDropped { table, .. }
             | SchemaDiff::ColumnAltered { table, .. }
             | SchemaDiff::ConstraintDropped { table, .. }
-            | SchemaDiff::TriggerDropped { table, .. } => {
+            | SchemaDiff::TriggerDropped { table, .. }
+            | SchemaDiff::IndexDropped {
+                table_name: table, ..
+            } => {
                 if references_dropped_table(table) {
                     continue;
                 }
@@ -1532,4 +1538,71 @@ pub async fn introspect_mysql(client: &DbClient, schema: &str) -> Result<SchemaS
         triggers,
         extensions: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests_generate_ddl_mysql {
+    use super::*;
+
+    fn col(name: &str, ty: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.into(),
+            data_type: ty.into(),
+            is_nullable: false,
+            default: None,
+            ordinal_position: 1,
+        }
+    }
+
+    #[test]
+    fn drop_index_emits_on_clause() {
+        let diffs = vec![SchemaDiff::IndexDropped {
+            name: "idx_users_email".into(),
+            table_name: "users".into(),
+        }];
+        let sql = generate_ddl_mysql(&diffs);
+        assert!(sql.contains("DROP INDEX `idx_users_email` ON `users`"));
+        // No PG-style "DROP INDEX IF EXISTS ...;" without ON clause.
+        assert!(!sql.contains("DROP INDEX `idx_users_email`;"));
+    }
+
+    #[test]
+    fn dependent_diffs_filtered_when_parent_table_dropped() {
+        // If we have TableDropped(t) AND ConstraintDropped/IndexDropped/
+        // ColumnAltered/etc. referencing t, only the TableDropped should remain
+        // in the output (others are implicit on MySQL).
+        let diffs = vec![
+            SchemaDiff::ConstraintDropped {
+                table: "t".into(),
+                name: "PRIMARY".into(),
+            },
+            SchemaDiff::IndexDropped {
+                name: "idx_t_x".into(),
+                table_name: "t".into(),
+            },
+            SchemaDiff::ColumnDropped {
+                table: "t".into(),
+                column: "x".into(),
+            },
+            SchemaDiff::TableDropped("t".into()),
+        ];
+        let sql = generate_ddl_mysql(&diffs);
+        assert!(sql.contains("DROP TABLE IF EXISTS `t`;"));
+        assert!(!sql.contains("DROP CONSTRAINT"));
+        assert!(!sql.contains("DROP INDEX `idx_t_x`"));
+        assert!(!sql.contains("DROP COLUMN"));
+    }
+
+    #[test]
+    fn table_added_uses_innodb_utf8mb4() {
+        let diffs = vec![SchemaDiff::TableAdded(TableDef {
+            schema: "db".into(),
+            name: "t".into(),
+            columns: vec![col("id", "int")],
+        })];
+        let sql = generate_ddl_mysql(&diffs);
+        assert!(sql.contains("CREATE TABLE `t`"));
+        assert!(sql.contains("ENGINE=InnoDB"));
+        assert!(sql.contains("utf8mb4"));
+    }
 }

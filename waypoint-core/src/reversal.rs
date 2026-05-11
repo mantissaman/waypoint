@@ -264,7 +264,10 @@ pub async fn store_reversal_db(
             let mut conn = pool.get_conn().await?;
             // MySQL doesn't allow self-referencing the target table in a
             // subquery during UPDATE, so we read the max rank first.
-            let max_rank: Option<i32> = conn
+            // SELECT MAX over a filtered set returns a row with NULL when no
+            // rows match, so we type as Option<Option<i32>> (outer = row exists,
+            // inner = MAX value or NULL) and flatten.
+            let max_rank: Option<Option<i32>> = conn
                 .exec_first(
                     format!(
                         "SELECT MAX(installed_rank) FROM {fq} \
@@ -273,7 +276,7 @@ pub async fn store_reversal_db(
                     (version,),
                 )
                 .await?;
-            if let Some(rank) = max_rank {
+            if let Some(rank) = max_rank.flatten() {
                 conn.exec_drop(
                     format!("UPDATE {fq} SET reversal_sql = ? WHERE installed_rank = ?"),
                     (reversal_sql, rank),
