@@ -1,10 +1,12 @@
-//! Integration tests for waypoint-core.
+//! Integration tests for waypoint-core (PostgreSQL).
 //!
 //! Requires a running PostgreSQL instance.
 //! Set TEST_DATABASE_URL env var, e.g.:
 //!   TEST_DATABASE_URL="host=localhost user=postgres dbname=waypoint_test"
 //!
 //! Run with: cargo test --test integration_test
+
+#![cfg(feature = "postgres")]
 
 use std::collections::HashMap;
 use std::path::PathBuf;

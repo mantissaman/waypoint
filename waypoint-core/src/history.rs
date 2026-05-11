@@ -12,7 +12,9 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
-use crate::db::{quote_ident, DbClient};
+#[cfg(feature = "postgres")]
+use crate::db::quote_ident;
+use crate::db::DbClient;
 use crate::dialect::DialectKind;
 use crate::error::{Result, WaypointError};
 

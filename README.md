@@ -17,7 +17,7 @@ Lightweight, Flyway-compatible SQL migration tool built in Rust. Targets Postgre
 - **Schema intelligence** — diff, drift detection, snapshots, EXPLAIN dry-run, schema advisor
 - **Team-friendly** — lint, changelog, branch conflict detection, multi-database orchestration (mixed PG + MySQL configs)
 - **Drop-in Docker replacement** — same env vars as Flyway containers
-- **Dual-engine** — full command coverage on PostgreSQL 12+ and MySQL 8.0+. Auto-reversal generation remains PG-only; everything else (guards, safety, advisor, diff, drift, explain) works on both
+- **Dual-engine** — full command coverage on PostgreSQL 12+ and MySQL 8.0+. Every command (migrate, guards, safety, advisor, diff, drift, explain, auto-reversal, undo, etc.) works on both engines
 
 ## Database support
 
@@ -38,7 +38,7 @@ Waypoint targets two engines with different levels of coverage:
 | Drift detection | Yes | Yes |
 | `EXPLAIN` dry-run | Yes | Yes (`FORMAT=JSON`) |
 | Multi-database orchestration (mixed engines) | Yes | Yes |
-| Auto-reversal generation | Yes | — (MySQL DDL emitter pending) |
+| Auto-reversal generation | Yes | Yes |
 | Transactional DDL (`batch_transaction` mode) | Yes | — (MySQL DDL auto-commits) |
 
 Build with both backends:

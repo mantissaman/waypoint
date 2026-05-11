@@ -451,32 +451,58 @@ async fn run_undo_mysql(
     };
 
     for version in &versions_to_undo {
-        let undo_migration = match undo_by_version.get(&version.raw) {
-            Some(m) => *m,
+        let (sql, script, description, checksum, auto_reversal) = match undo_by_version
+            .get(&version.raw)
+        {
+            Some(m) => {
+                // Manual U file: highest precedence.
+                let placeholders =
+                    build_placeholders(&config.placeholders, schema, &db_user, &db_name, &m.script);
+                let sql = replace_placeholders(&m.sql, &placeholders)?;
+                log::info!(
+                    "Undoing migration (manual); migration={}, schema={}",
+                    m.script,
+                    schema
+                );
+                (
+                    sql,
+                    m.script.clone(),
+                    m.description.clone(),
+                    Some(m.checksum),
+                    false,
+                )
+            }
+            None if config.reversals.enabled => {
+                // Fall back to auto-generated reversal SQL stored in history.
+                match crate::reversal::get_reversal_db(client, schema, table, &version.raw).await? {
+                    Some(reversal_sql) => {
+                        let script = format!("auto-reversal:V{}", version.raw);
+                        log::info!(
+                            "Undoing migration (auto-reversal); version={}, schema={}",
+                            version.raw,
+                            schema
+                        );
+                        (
+                            reversal_sql,
+                            script,
+                            "Auto-generated reversal".to_string(),
+                            None,
+                            true,
+                        )
+                    }
+                    None => {
+                        return Err(WaypointError::UndoMissing {
+                            version: version.raw.clone(),
+                        });
+                    }
+                }
+            }
             None => {
-                // Phase 1 MySQL undo does not support auto-reversal — fail fast
-                // and ask the user for an explicit U file. When reversal-gen
-                // lands on MySQL (Phase 3) this branch becomes the fall-back.
                 return Err(WaypointError::UndoMissing {
                     version: version.raw.clone(),
                 });
             }
         };
-
-        log::info!(
-            "Undoing migration (manual); migration={}, schema={}",
-            undo_migration.script,
-            schema
-        );
-
-        let placeholders = build_placeholders(
-            &config.placeholders,
-            schema,
-            &db_user,
-            &db_name,
-            &undo_migration.script,
-        );
-        let sql = replace_placeholders(&undo_migration.sql, &placeholders)?;
 
         let start = std::time::Instant::now();
         let exec_result = client.execute_raw(&sql).await;
@@ -484,16 +510,15 @@ async fn run_undo_mysql(
 
         match exec_result {
             Ok(_) => {
-                // Record success
                 history::insert_applied_migration_db(
                     client,
                     schema,
                     table,
                     Some(&version.raw),
-                    &undo_migration.description,
+                    &description,
                     "UNDO_SQL",
-                    &undo_migration.script,
-                    Some(undo_migration.checksum),
+                    &script,
+                    checksum,
                     &installed_by,
                     exec_time,
                     true,
@@ -504,25 +529,24 @@ async fn run_undo_mysql(
                 report.total_time_ms += exec_time;
                 report.details.push(UndoDetail {
                     version: version.raw.clone(),
-                    description: undo_migration.description.clone(),
-                    script: undo_migration.script.clone(),
+                    description: description.clone(),
+                    script: script.clone(),
                     execution_time_ms: exec_time,
-                    auto_reversal: false,
+                    auto_reversal,
                 });
             }
             Err(e) => {
-                // Best-effort failure record. MySQL DDL auto-commits so the
-                // schema may be in a partially-undone state; we report the
-                // failure with a clear message and let the operator decide.
+                // MySQL DDL auto-commits so the schema may be in a partially-
+                // undone state; record the failure and surface a clear error.
                 if let Err(record_err) = history::insert_applied_migration_db(
                     client,
                     schema,
                     table,
                     Some(&version.raw),
-                    &undo_migration.description,
+                    &description,
                     "UNDO_SQL",
-                    &undo_migration.script,
-                    Some(undo_migration.checksum),
+                    &script,
+                    checksum,
                     &installed_by,
                     exec_time,
                     false,
@@ -531,12 +555,12 @@ async fn run_undo_mysql(
                 {
                     log::warn!(
                         "Failed to record undo failure; script={}, error={}",
-                        undo_migration.script,
+                        script,
                         record_err
                     );
                 }
                 return Err(WaypointError::UndoFailed {
-                    script: undo_migration.script.clone(),
+                    script: script.clone(),
                     reason: e.to_string(),
                 });
             }

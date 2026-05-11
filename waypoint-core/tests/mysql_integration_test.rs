@@ -780,18 +780,43 @@ async fn undo_with_manual_u_file_reverts_table() {
 }
 
 #[tokio::test]
-async fn undo_without_u_file_errors_with_undo_missing() {
+async fn undo_without_u_file_uses_auto_reversal_by_default() {
     use waypoint_core::commands::undo::UndoTarget;
     let db = fresh_database("undomiss").await;
     let name = db.name();
     let tempdir = tempfile::tempdir().unwrap();
     let migrations = tempdir.path().to_path_buf();
-    // V1 with no corresponding U1 file
+    // V1 with no corresponding U1 file: auto-reversal kicks in by default.
     write_migrations(
         &migrations,
         &[("V1__Create.sql", "CREATE TABLE t (id INT PRIMARY KEY);")],
     );
     let config = config_for(name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+    wp.migrate(None).await.expect("migrate");
+
+    let report = wp
+        .undo(UndoTarget::Last)
+        .await
+        .expect("undo via auto-reversal");
+    assert_eq!(report.migrations_undone, 1);
+    assert!(report.details[0].auto_reversal);
+}
+
+#[tokio::test]
+async fn undo_errors_when_no_u_file_and_reversals_disabled() {
+    use waypoint_core::commands::undo::UndoTarget;
+    let db = fresh_database("undonorev").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[("V1__Create.sql", "CREATE TABLE t (id INT PRIMARY KEY);")],
+    );
+    let mut config = config_for(name, migrations);
+    // Disable reversal generation so undo has nothing to fall back to.
+    config.reversals.enabled = false;
     let wp = Waypoint::new(config).await.expect("connect");
     wp.migrate(None).await.expect("migrate");
 
@@ -801,5 +826,85 @@ async fn undo_without_u_file_errors_with_undo_missing() {
         msg.contains("No undo migration found") || msg.contains("U1__"),
         "expected UndoMissing-style error, got: {}",
         msg
+    );
+}
+
+#[tokio::test]
+async fn undo_falls_back_to_auto_reversal_on_mysql() {
+    use waypoint_core::commands::undo::UndoTarget;
+    let db = fresh_database("autorev").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    // V1 creates a table — no U1 file. The auto-reversal stored at migrate
+    // time should let undo drop the table without manual undo SQL.
+    write_migrations(
+        &migrations,
+        &[(
+            "V1__Create.sql",
+            "CREATE TABLE auto_rev_target (id INT PRIMARY KEY);",
+        )],
+    );
+    let config = config_for(name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    wp.migrate(None).await.expect("migrate");
+
+    // Confirm table is there + reversal_sql was populated
+    let pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
+    let mut conn = pool.get_conn().await.unwrap();
+    let before: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'auto_rev_target'",
+            (name,),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        before.len(),
+        1,
+        "auto_rev_target should exist after migrate"
+    );
+    let stored: Option<Option<String>> = conn
+        .exec_first(
+            "SELECT reversal_sql FROM waypoint_schema_history \
+             WHERE version = '1' AND success = 1 ORDER BY installed_rank DESC LIMIT 1",
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(
+        stored.flatten().is_some(),
+        "reversal_sql should be populated by migrate"
+    );
+    drop(conn);
+    pool.disconnect().await.ok();
+
+    // Undo using the stored auto-reversal (no U1 file exists)
+    let report = wp
+        .undo(UndoTarget::Last)
+        .await
+        .expect("undo via auto-reversal");
+    assert_eq!(report.migrations_undone, 1);
+    assert!(
+        report.details[0].auto_reversal,
+        "should report auto_reversal=true"
+    );
+
+    // Table should be gone
+    let pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
+    let mut conn = pool.get_conn().await.unwrap();
+    let after: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'auto_rev_target'",
+            (name,),
+        )
+        .await
+        .unwrap();
+    assert!(
+        after.is_empty(),
+        "auto_rev_target should be dropped by auto-reversal"
     );
 }

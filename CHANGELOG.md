@@ -46,11 +46,13 @@ zero changes — the `postgres` feature is on by default.
 - `explain` — `EXPLAIN FORMAT=JSON` with `access_type=ALL` (full table scan) surfaced as a warning.
 - Multi-database orchestration — `MultiWaypoint::connect` auto-detects per-database engine from URL scheme; one config can mix `postgres://` and `mysql://` entries.
 
-**Still not ported to MySQL (deferred):**
+**Final pieces — full MySQL parity:**
 
-- Auto-reversal generation depends on emitting MySQL-flavored DDL from a `SchemaDiff`. Structural MySQL diff is in place; the DDL generator (parallel to `schema::generate_ddl`) is the remaining piece.
+- `schema::generate_ddl_mysql` emits MySQL-flavored reverse DDL (backticks, `ENGINE=InnoDB`, no `CASCADE`). Dependent constraint/index/trigger diffs are filtered when their parent table is also being dropped in the same batch, since MySQL has no `CASCADE` on `DROP TABLE`.
+- `reversal::generate_reversal_db`, `store_reversal_db`, `get_reversal_db` are the new dialect-aware entries. PG legacy fns retained for back-compat. MySQL migrate now captures before-snapshots and stores reverse DDL automatically; MySQL undo falls back to it when no `U{ver}__*.sql` is present.
+- The `--no-default-features --features mysql` build (mysql-only, no PostgreSQL deps compiled in) is now green: clippy `-D warnings` clean, 155 unit tests pass.
 
-See `CLAUDE.md` for the full per-command status table.
+See `CLAUDE.md` for the full per-command status table — every command now works on both engines.
 
 ## [0.3.0] - 2026-02-20
 

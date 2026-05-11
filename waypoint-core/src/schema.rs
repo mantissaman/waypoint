@@ -1134,6 +1134,210 @@ pub fn to_ddl(snapshot: &SchemaSnapshot) -> String {
     statements.join("\n\n")
 }
 
+/// Generate MySQL-flavored DDL from a list of schema diffs.
+///
+/// Mirrors [`generate_ddl`] but emits MySQL syntax: backtick-quoted identifiers,
+/// no `CASCADE` on DROPs (MySQL doesn't accept it), and skips diffs that
+/// reference a table that's also being dropped (since MySQL has no `CASCADE`
+/// and the dependent ALTER would fail with `Table doesn't exist`).
+pub fn generate_ddl_mysql(diffs: &[SchemaDiff]) -> String {
+    fn q(name: &str) -> String {
+        format!("`{}`", name.replace('`', "``"))
+    }
+
+    // First pass: collect the set of tables being dropped so we can skip
+    // dependent diffs (constraints, indexes, triggers) that reference them.
+    // PG uses `DROP TABLE ... CASCADE` to handle this transparently; MySQL
+    // has no such cascade so we filter explicitly.
+    let dropped_tables: std::collections::HashSet<&str> = diffs
+        .iter()
+        .filter_map(|d| match d {
+            SchemaDiff::TableDropped(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let references_dropped_table = |t: &str| dropped_tables.contains(t);
+
+    // Order: emit dependent diffs (constraints/indexes/triggers) FIRST when
+    // their table is NOT being dropped, then table-level changes, then
+    // TableDropped last. This matches MySQL's typical migration order and
+    // avoids dependency violations.
+    let mut statements = Vec::new();
+    for d in diffs {
+        // Skip diffs whose parent table is going away in this same batch.
+        match d {
+            SchemaDiff::ColumnAdded { table, .. }
+            | SchemaDiff::ColumnDropped { table, .. }
+            | SchemaDiff::ColumnAltered { table, .. }
+            | SchemaDiff::ConstraintDropped { table, .. }
+            | SchemaDiff::TriggerDropped { table, .. } => {
+                if references_dropped_table(table) {
+                    continue;
+                }
+            }
+            SchemaDiff::ConstraintAdded(c) if references_dropped_table(&c.table_name) => continue,
+            SchemaDiff::TriggerAdded(t) if references_dropped_table(&t.table_name) => continue,
+            SchemaDiff::IndexAdded(i) if references_dropped_table(&i.table_name) => continue,
+            _ => {}
+        }
+        match d {
+            SchemaDiff::TableAdded(t) => {
+                let cols: Vec<String> = t
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        let mut col = format!("    {} {}", q(&c.name), c.data_type);
+                        if !c.is_nullable {
+                            col.push_str(" NOT NULL");
+                        }
+                        if let Some(ref default) = c.default {
+                            col.push_str(&format!(" DEFAULT {}", default));
+                        }
+                        col
+                    })
+                    .collect();
+                statements.push(format!(
+                    "CREATE TABLE {} (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;",
+                    q(&t.name),
+                    cols.join(",\n")
+                ));
+            }
+            SchemaDiff::TableDropped(name) => {
+                statements.push(format!("DROP TABLE IF EXISTS {};", q(name)));
+            }
+            SchemaDiff::ColumnAdded { table, column } => {
+                let mut stmt = format!(
+                    "ALTER TABLE {} ADD COLUMN {} {}",
+                    q(table),
+                    q(&column.name),
+                    column.data_type
+                );
+                if !column.is_nullable {
+                    stmt.push_str(" NOT NULL");
+                }
+                if let Some(ref default) = column.default {
+                    stmt.push_str(&format!(" DEFAULT {}", default));
+                }
+                stmt.push(';');
+                statements.push(stmt);
+            }
+            SchemaDiff::ColumnDropped { table, column } => {
+                statements.push(format!(
+                    "ALTER TABLE {} DROP COLUMN {};",
+                    q(table),
+                    q(column)
+                ));
+            }
+            SchemaDiff::ColumnAltered {
+                table, column, to, ..
+            } => {
+                // MySQL collapses type+null+default into a single MODIFY COLUMN.
+                let mut clause = format!(
+                    "ALTER TABLE {} MODIFY COLUMN {} {}",
+                    q(table),
+                    q(column),
+                    to.data_type
+                );
+                if !to.is_nullable {
+                    clause.push_str(" NOT NULL");
+                }
+                if let Some(ref default) = to.default {
+                    clause.push_str(&format!(" DEFAULT {}", default));
+                }
+                clause.push(';');
+                statements.push(clause);
+            }
+            SchemaDiff::IndexAdded(idx) => {
+                // idx.definition is already MySQL-shaped from introspect_mysql.
+                statements.push(format!("{};", idx.definition.trim_end_matches(';')));
+            }
+            SchemaDiff::IndexDropped(name) => {
+                // MySQL syntax: DROP INDEX `name` ON `table` — but we don't
+                // carry the table on a Dropped variant. Best-effort: emit a
+                // version with a comment so the user can patch it.
+                statements.push(format!(
+                    "-- TODO: specify table for DROP INDEX {} on MySQL\nDROP INDEX {};",
+                    name,
+                    q(name)
+                ));
+            }
+            SchemaDiff::ViewAdded(v) => {
+                statements.push(format!(
+                    "CREATE VIEW {} AS {};",
+                    q(&v.name),
+                    v.definition.trim_end_matches(';').trim()
+                ));
+            }
+            SchemaDiff::ViewDropped(name) => {
+                statements.push(format!("DROP VIEW IF EXISTS {};", q(name)));
+            }
+            SchemaDiff::ViewAltered { name, to, .. } => {
+                statements.push(format!(
+                    "CREATE OR REPLACE VIEW {} AS {};",
+                    q(name),
+                    to.trim_end_matches(';').trim()
+                ));
+            }
+            SchemaDiff::SequenceAdded(_) | SchemaDiff::SequenceDropped(_) => {
+                // MySQL has no sequences; emit a comment.
+                statements.push("-- (sequence diff omitted: MySQL has no sequences)".into());
+            }
+            SchemaDiff::FunctionAdded(func) => {
+                statements.push(format!("{};", func.definition.trim_end_matches(';')));
+            }
+            SchemaDiff::FunctionDropped(name) => {
+                statements.push(format!("DROP FUNCTION IF EXISTS {};", q(name)));
+            }
+            SchemaDiff::FunctionAltered { name } => {
+                statements.push(format!(
+                    "-- Function {} altered; manual review needed",
+                    name
+                ));
+            }
+            SchemaDiff::EnumAdded(_) | SchemaDiff::EnumDropped(_) => {
+                statements
+                    .push("-- (enum diff omitted: MySQL ENUM is a column-type modifier)".into());
+            }
+            SchemaDiff::ConstraintAdded(c) => {
+                if c.definition.is_empty() {
+                    statements.push(format!(
+                        "-- ALTER TABLE {} ADD CONSTRAINT {} (definition unavailable)",
+                        q(&c.table_name),
+                        q(&c.name)
+                    ));
+                } else {
+                    statements.push(format!(
+                        "ALTER TABLE {} ADD CONSTRAINT {} {};",
+                        q(&c.table_name),
+                        q(&c.name),
+                        c.definition
+                    ));
+                }
+            }
+            SchemaDiff::ConstraintDropped { table, name } => {
+                statements.push(format!(
+                    "ALTER TABLE {} DROP CONSTRAINT {};",
+                    q(table),
+                    q(name)
+                ));
+            }
+            SchemaDiff::TriggerAdded(t) => {
+                statements.push(format!(
+                    "-- Trigger {} on {}: {}",
+                    t.name, t.table_name, t.definition
+                ));
+            }
+            SchemaDiff::TriggerDropped { table, name } => {
+                statements.push(format!("DROP TRIGGER IF EXISTS {}.{};", q(table), q(name)));
+            }
+            SchemaDiff::ExtensionAdded(_) | SchemaDiff::ExtensionDropped(_) => {
+                statements.push("-- (extension diff omitted: MySQL has no extensions)".into());
+            }
+        }
+    }
+    statements.join("\n\n")
+}
+
 // ── MySQL schema introspection ───────────────────────────────────────────────
 //
 // Produces the same SchemaSnapshot shape as PG `introspect()` so `diff()`

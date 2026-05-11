@@ -5,11 +5,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test
 
 ```bash
-cargo build                                              # Build both crates (default: postgres feature)
-cargo build --features mysql                             # Build with MySQL backend
-cargo test --lib                                         # Unit tests (postgres only, 261 tests)
-cargo test --features mysql --lib                        # Unit tests with both backends (267 tests)
-cargo test --features mysql --test mysql_integration_test  # MySQL integration tests (18 tests, needs container)
+cargo build                                                          # Build both crates (default: postgres feature)
+cargo build --features mysql                                         # Build with MySQL backend (postgres + mysql)
+cargo build -p waypoint-core --no-default-features --features mysql  # MySQL-only (no PostgreSQL deps compiled in)
+cargo test --lib                                                     # Unit tests (postgres only, 261 tests)
+cargo test --features mysql --lib                                    # Unit tests with both backends (267 tests)
+cargo test -p waypoint-core --no-default-features --features mysql --lib  # MySQL-only unit tests (155 tests)
+cargo test --features mysql --test mysql_integration_test            # MySQL integration tests (20 tests, needs container)
 cargo test                                               # Integration tests need TEST_DATABASE_URL (PG)
 cargo clippy --features mysql --all-targets -- -D warnings  # Lint (use --features mysql to cover both paths)
 cargo fmt --check                                        # Format check
@@ -79,7 +81,7 @@ No-DB commands (pure file analysis): `lint`, `changelog`, `check_conflicts` — 
 | `clean` | ✅ working | Disables FOREIGN_KEY_CHECKS, drops views/tables/routines/events |
 | `snapshot` | ✅ working | `SHOW CREATE TABLE` / `SHOW CREATE VIEW` based |
 | `restore` | ✅ working | Wipes target DB, replays snapshot via MySQL-aware splitter |
-| `undo` | ✅ working | Manual U-files only — auto-reversal generation still PG-specific |
+| `undo` | ✅ working | Manual U-files take precedence; falls back to auto-generated reversal via `generate_ddl_mysql` |
 | `preflight` | ✅ working | 6 MySQL checks: read-only, connections, processlist, replica lag, db size, metadata locks |
 | `simulate` | ✅ working | Replicates tables + views into a temp DB via SHOW CREATE; view DB qualifiers rewritten |
 | `safety` | ✅ working | Pessimistic worst-case ALGORITHM=COPY lock mapping; size from `information_schema.tables.table_rows` |
@@ -90,7 +92,7 @@ No-DB commands (pure file analysis): `lint`, `changelog`, `check_conflicts` — 
 | `explain` | ✅ working | `EXPLAIN FORMAT=JSON`; access_type=ALL surfaced as a warning |
 | `lint` / `changelog` / `check-conflicts` | ✅ working | No-DB; engine-agnostic |
 | Multi-database orchestration | ✅ working | Mixed-engine configs (PG + MySQL in the same `[[databases]]` list) supported |
-| Auto-reversal generation | ⚠️ PG only | Depends on PG-specific DDL generation; structural MySQL diff lands, DDL emission deferred |
+| Auto-reversal generation | ✅ working | `schema::generate_ddl_mysql` emits MySQL-flavored reverse DDL; dependent constraint/index diffs filtered when their parent table is also being dropped (since MySQL has no CASCADE) |
 
 ### CLI (waypoint-cli/src/)
 

@@ -1,6 +1,8 @@
 //! Apply pending migrations to the database.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(feature = "postgres")]
+use std::collections::HashSet;
 
 use serde::Serialize;
 
@@ -77,6 +79,7 @@ enum GuardAction {
 }
 
 /// Common state prepared by `prepare_migrate()` for both run modes.
+#[cfg(feature = "postgres")]
 struct MigrateSetup<'a> {
     /// All resolved migration files on disk.
     resolved: Vec<ResolvedMigration>,
@@ -104,6 +107,7 @@ struct MigrateSetup<'a> {
 
 /// Perform all shared setup: history table creation, validation, preflight,
 /// file scanning, hooks loading, version computation.
+#[cfg(feature = "postgres")]
 async fn prepare_migrate<'a>(
     client: &Client,
     config: &'a WaypointConfig,
@@ -214,6 +218,7 @@ async fn prepare_migrate<'a>(
 
 /// Filter resolved migrations down to pending versioned ones, applying
 /// baseline/target/out-of-order checks.
+#[cfg(feature = "postgres")]
 fn filter_pending_versioned<'a>(
     versioned: &[&'a ResolvedMigration],
     setup: &MigrateSetup<'_>,
@@ -262,6 +267,7 @@ fn filter_pending_versioned<'a>(
 }
 
 /// Filter resolved migrations down to pending repeatable ones (checksum changed or new).
+#[cfg(feature = "postgres")]
 fn filter_pending_repeatables<'a>(
     repeatables: &[&'a ResolvedMigration],
     setup: &MigrateSetup<'_>,
@@ -283,6 +289,7 @@ fn filter_pending_repeatables<'a>(
 /// Returns `GuardAction::Continue` if all guards pass, `GuardAction::Skip` if
 /// the migration should be skipped (when `on_require_fail = Skip`), or
 /// `GuardAction::Error` if a fatal guard failure occurs.
+#[cfg(feature = "postgres")]
 async fn evaluate_require_guards(
     client: &Client,
     schema: &str,
@@ -540,6 +547,7 @@ pub async fn execute_with_options(
     result
 }
 
+#[cfg(feature = "postgres")]
 async fn run_migrate(
     client: &Client,
     config: &WaypointConfig,
@@ -834,6 +842,7 @@ async fn run_migrate(
 }
 
 /// Pre-compiled regexes for batch-compatibility checks.
+#[cfg(feature = "postgres")]
 mod batch_regexes {
     use std::sync::LazyLock;
     pub static DROP_INDEX_CONCURRENT: LazyLock<regex_lite::Regex> =
@@ -854,6 +863,7 @@ mod batch_regexes {
 ///
 /// Returns an error if CONCURRENTLY, CREATE DATABASE, DROP DATABASE, VACUUM, CLUSTER,
 /// or REINDEX CONCURRENTLY are found. Uses pre-compiled static regexes for efficiency.
+#[cfg(feature = "postgres")]
 fn validate_batch_compatible(script: &str, sql: &str) -> Result<()> {
     let upper = sql.to_uppercase();
 
@@ -917,6 +927,7 @@ fn validate_batch_compatible(script: &str, sql: &str) -> Result<()> {
 }
 
 /// Run all pending migrations in a single transaction (all-or-nothing batch mode).
+#[cfg(feature = "postgres")]
 async fn run_batch_migrate(
     client: &Client,
     config: &WaypointConfig,
@@ -1304,6 +1315,7 @@ async fn run_batch_migrate(
 /// commits the transaction. When `hold_transaction` is `true`, the transaction
 /// is left open so the caller can evaluate ensure guards before committing.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "postgres")]
 async fn apply_migration(
     client: &Client,
     config: &WaypointConfig,
@@ -1673,6 +1685,13 @@ async fn run_migrate_mysql(
         )
         .await?;
 
+        // Capture before-snapshot for auto-reversal if enabled.
+        let before_snapshot = if config.reversals.enabled && m.is_versioned() {
+            Some(crate::reversal::capture_before_db(client, &schema).await?)
+        } else {
+            None
+        };
+
         let elapsed =
             apply_one_mysql(client, m, &schema, table, &installed_by, &placeholders).await?;
         report.migrations_applied += 1;
@@ -1689,6 +1708,48 @@ async fn run_migrate_mysql(
         // migration — it surfaces as a hard error and leaves the schema in
         // the post-migration state. This is the documented MySQL caveat.
         evaluate_ensure_guards_db(client, &schema, m).await?;
+
+        // Auto-reversal generation. We compute it AFTER the apply succeeds
+        // (so we can introspect the after-state) and after ensure-guards pass
+        // (so we don't store a reversal for a half-applied migration). Failure
+        // to generate or store is logged but not fatal — the migration is
+        // already applied successfully on disk.
+        if let (Some(before), Some(ver)) = (before_snapshot.as_ref(), m.version()) {
+            match crate::reversal::generate_reversal_db(
+                client,
+                &schema,
+                before,
+                config.reversals.warn_data_loss,
+            )
+            .await
+            {
+                Ok(result) => {
+                    if let Some(ref reversal_sql) = result.reversal_sql {
+                        if let Err(e) = crate::reversal::store_reversal_db(
+                            client,
+                            &schema,
+                            table,
+                            &ver.raw,
+                            reversal_sql,
+                        )
+                        .await
+                        {
+                            log::warn!(
+                                "Failed to store reversal SQL; version={}, error={}",
+                                ver.raw,
+                                e
+                            );
+                        }
+                        for w in &result.warnings {
+                            log::warn!("Reversal warning for version {}: {}", ver.raw, w);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to generate reversal for version {}: {}", ver.raw, e);
+                }
+            }
+        }
 
         fire_hooks(
             client,
@@ -1819,7 +1880,7 @@ async fn apply_one_mysql(
     Ok(elapsed)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 mod tests {
     use super::*;
 

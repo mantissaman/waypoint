@@ -5,9 +5,14 @@
 //! requiring manual `U{version}__*.sql` files.
 
 use serde::Serialize;
+
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
+#[cfg(feature = "postgres")]
 use crate::db::quote_ident;
+use crate::db::DbClient;
+use crate::dialect::DialectKind;
 use crate::error::Result;
 use crate::schema::{self, SchemaDiff, SchemaSnapshot};
 
@@ -40,12 +45,20 @@ pub struct ReversalResult {
     pub warnings: Vec<String>,
 }
 
-/// Capture a schema snapshot before migration execution.
+/// Capture a schema snapshot before migration execution (PostgreSQL legacy).
+#[cfg(feature = "postgres")]
 pub async fn capture_before(client: &Client, schema: &str) -> Result<SchemaSnapshot> {
     schema::introspect(client, schema).await
 }
 
-/// Capture a schema snapshot after migration execution and generate reverse DDL.
+/// Capture a schema snapshot before migration execution (dialect-aware).
+pub async fn capture_before_db(client: &DbClient, schema: &str) -> Result<SchemaSnapshot> {
+    schema::introspect_db(client, schema).await
+}
+
+/// Capture a schema snapshot after migration execution and generate reverse
+/// DDL (PostgreSQL legacy).
+#[cfg(feature = "postgres")]
 pub async fn generate_reversal(
     client: &Client,
     schema_name: &str,
@@ -113,7 +126,8 @@ pub async fn generate_reversal(
     })
 }
 
-/// Store reversal SQL in the history table for a specific version.
+/// Store reversal SQL in the history table for a specific version (PG legacy).
+#[cfg(feature = "postgres")]
 pub async fn store_reversal(
     client: &Client,
     schema: &str,
@@ -133,7 +147,8 @@ pub async fn store_reversal(
     Ok(())
 }
 
-/// Retrieve stored reversal SQL for a specific version.
+/// Retrieve stored reversal SQL for a specific version (PG legacy).
+#[cfg(feature = "postgres")]
 pub async fn get_reversal(
     client: &Client,
     schema: &str,
@@ -151,6 +166,159 @@ pub async fn get_reversal(
         Ok(row.get::<_, Option<String>>(0))
     } else {
         Ok(None)
+    }
+}
+
+// ── Dialect-aware reversal generation/storage/retrieval ──────────────────────
+
+/// Capture an after-snapshot, diff against `before`, and produce a reversal
+/// SQL string suitable for storing in `waypoint_schema_history.reversal_sql`.
+/// Dispatches to the right DDL generator (PG vs MySQL) based on the connection.
+pub async fn generate_reversal_db(
+    client: &DbClient,
+    schema_name: &str,
+    before: &SchemaSnapshot,
+    warn_data_loss: bool,
+) -> Result<ReversalResult> {
+    let after = schema::introspect_db(client, schema_name).await?;
+    let reverse_diffs = schema::diff(&after, before);
+
+    if reverse_diffs.is_empty() {
+        return Ok(ReversalResult {
+            reversal_sql: None,
+            has_data_loss: false,
+            warnings: vec!["No schema changes detected; no reversal generated.".to_string()],
+        });
+    }
+
+    let mut has_data_loss = false;
+    let mut warnings = Vec::new();
+    for d in &reverse_diffs {
+        match d {
+            SchemaDiff::TableDropped(name) => {
+                has_data_loss = true;
+                if warn_data_loss {
+                    warnings.push(format!(
+                        "DATA_LOSS: DROP TABLE {} — original data cannot be restored",
+                        name
+                    ));
+                }
+            }
+            SchemaDiff::ColumnDropped { table, column } => {
+                has_data_loss = true;
+                if warn_data_loss {
+                    warnings.push(format!(
+                        "DATA_LOSS: DROP COLUMN {}.{} — original data cannot be restored",
+                        table, column
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Emit DDL in the dialect of the connection.
+    let mut sql = match client.dialect_kind() {
+        DialectKind::Postgres => schema::generate_ddl(&reverse_diffs),
+        DialectKind::Mysql => schema::generate_ddl_mysql(&reverse_diffs),
+    };
+
+    if has_data_loss && warn_data_loss {
+        let warning_comments: Vec<String> = warnings
+            .iter()
+            .map(|w| format!("-- WARNING: {}", w))
+            .collect();
+        sql = format!("{}\n\n{}", warning_comments.join("\n"), sql);
+    }
+
+    Ok(ReversalResult {
+        reversal_sql: Some(sql),
+        has_data_loss,
+        warnings,
+    })
+}
+
+/// Store reversal SQL in the history table (dialect-aware).
+pub async fn store_reversal_db(
+    client: &DbClient,
+    schema: &str,
+    table: &str,
+    version: &str,
+    reversal_sql: &str,
+) -> Result<()> {
+    let dialect = client.dialect();
+    let fq = dialect.qualified_table(schema, table);
+    match client {
+        #[cfg(feature = "postgres")]
+        DbClient::Postgres(c) => {
+            let sql = format!(
+                "UPDATE {fq} SET reversal_sql = $1 WHERE version = $2 AND success = TRUE \
+                 AND installed_rank = (SELECT MAX(installed_rank) FROM {fq} \
+                 WHERE version = $2 AND success = TRUE)"
+            );
+            c.execute(&sql, &[&reversal_sql, &version]).await?;
+        }
+        #[cfg(feature = "mysql")]
+        DbClient::Mysql(pool) => {
+            use mysql_async::prelude::*;
+            let mut conn = pool.get_conn().await?;
+            // MySQL doesn't allow self-referencing the target table in a
+            // subquery during UPDATE, so we read the max rank first.
+            let max_rank: Option<i32> = conn
+                .exec_first(
+                    format!(
+                        "SELECT MAX(installed_rank) FROM {fq} \
+                         WHERE version = ? AND success = TRUE"
+                    ),
+                    (version,),
+                )
+                .await?;
+            if let Some(rank) = max_rank {
+                conn.exec_drop(
+                    format!("UPDATE {fq} SET reversal_sql = ? WHERE installed_rank = ?"),
+                    (reversal_sql, rank),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Retrieve stored reversal SQL for a specific version (dialect-aware).
+pub async fn get_reversal_db(
+    client: &DbClient,
+    schema: &str,
+    table: &str,
+    version: &str,
+) -> Result<Option<String>> {
+    let dialect = client.dialect();
+    let fq = dialect.qualified_table(schema, table);
+    match client {
+        #[cfg(feature = "postgres")]
+        DbClient::Postgres(c) => {
+            let sql = format!(
+                "SELECT reversal_sql FROM {fq} WHERE version = $1 AND success = TRUE \
+                 ORDER BY installed_rank DESC LIMIT 1"
+            );
+            let rows = c.query(&sql, &[&version]).await?;
+            Ok(rows.first().and_then(|r| r.get::<_, Option<String>>(0)))
+        }
+        #[cfg(feature = "mysql")]
+        DbClient::Mysql(pool) => {
+            use mysql_async::prelude::*;
+            let mut conn = pool.get_conn().await?;
+            let row: Option<Option<String>> = conn
+                .exec_first(
+                    format!(
+                        "SELECT reversal_sql FROM {fq} WHERE version = ? AND success = TRUE \
+                         ORDER BY installed_rank DESC LIMIT 1"
+                    ),
+                    (version,),
+                )
+                .await?;
+            Ok(row.flatten())
+        }
     }
 }
 

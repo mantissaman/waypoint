@@ -220,6 +220,7 @@ pub fn lock_level_for_ddl(op: &DdlOperation) -> LockLevel {
 ///
 /// Returns the classification and the estimated row count from
 /// `pg_stat_user_tables.n_live_tup`.
+#[cfg(feature = "postgres")]
 pub async fn classify_table_size(
     client: &tokio_postgres::Client,
     schema: &str,
@@ -459,6 +460,7 @@ fn compute_verdict(lock: LockLevel, size: TableSize, data_loss: bool) -> SafetyV
 }
 
 /// Generate actionable suggestions for a DDL operation based on table size.
+#[cfg(feature = "postgres")]
 fn generate_suggestions(op: &DdlOperation, size: TableSize) -> Vec<String> {
     let mut suggestions = Vec::new();
 
@@ -530,6 +532,7 @@ fn affected_table(op: &DdlOperation) -> Option<String> {
 /// Parses the SQL into individual DDL operations, queries the database
 /// for table size statistics, and produces a [`SafetyReport`] with
 /// per-statement verdicts and suggestions.
+#[cfg(feature = "postgres")]
 pub async fn analyze_migration(
     client: &tokio_postgres::Client,
     schema: &str,
@@ -604,7 +607,7 @@ pub async fn analyze_migration(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 mod tests {
     use super::*;
 

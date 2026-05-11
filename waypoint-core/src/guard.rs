@@ -560,6 +560,7 @@ pub fn parse(input: &str) -> Result<GuardExpr> {
 /// Returns `(sql, params, is_boolean)` — `params` contains the parameter values
 /// in order ($1, $2, $3...), and `is_boolean` is `true` when the query returns
 /// a single boolean, `false` when it returns a count (Number).
+#[cfg(feature = "postgres")]
 fn builtin_sql(name: &str, args: &[String], schema: &str) -> Result<(String, Vec<String>, bool)> {
     match name {
         "table_exists" => {
@@ -1189,7 +1190,11 @@ fn guard_failed(name: &str, args: &[String], reason: &str) -> WaypointError {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// Many of these reference the PG-specific `builtin_sql`. They cover the
+// engine-agnostic parser too, but gating individual tests would be noisier
+// than gating the module; the parser is covered under both the default
+// (postgres) and `--features mysql` (postgres+mysql) builds.
+#[cfg(all(test, feature = "postgres"))]
 mod tests {
     use super::*;
 

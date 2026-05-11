@@ -276,7 +276,10 @@ impl Waypoint {
 }
 
 /// Connect to whichever backend the URL scheme indicates.
-async fn connect_for_url(conn_string: &str, config: &WaypointConfig) -> Result<DbClient> {
+async fn connect_for_url(
+    conn_string: &str,
+    #[cfg_attr(not(feature = "postgres"), allow(unused_variables))] config: &WaypointConfig,
+) -> Result<DbClient> {
     let kind = DialectKind::from_url(conn_string).unwrap_or(DialectKind::Postgres);
     match kind {
         #[cfg(feature = "postgres")]

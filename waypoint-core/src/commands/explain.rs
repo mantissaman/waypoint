@@ -16,6 +16,7 @@ use crate::error::Result;
 #[cfg(any(not(feature = "postgres"), not(feature = "mysql")))]
 use crate::error::WaypointError;
 use crate::placeholder::{build_placeholders, replace_placeholders};
+#[cfg(feature = "postgres")]
 use crate::sql_parser::split_statements;
 
 /// EXPLAIN report for all pending migrations.
@@ -355,6 +356,7 @@ fn extract_plan_info_mysql(plan: &str) -> (Option<f64>, Vec<String>) {
     (rows, warnings)
 }
 
+#[cfg(feature = "postgres")]
 fn extract_plan_info_text(plan_text: &str) -> (Option<f64>, Option<f64>, Vec<String>) {
     let mut warnings = Vec::new();
     let mut total_rows = None;
