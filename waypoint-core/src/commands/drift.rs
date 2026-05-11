@@ -128,7 +128,7 @@ async fn run_drift_check(
 
     // Apply versioned migrations that were successfully applied
     for migration in resolved.iter().filter(|m| m.is_versioned()) {
-        let version = migration.version().unwrap();
+        let version = migration.version().expect("filtered to versioned");
         if !effective.contains(&version.raw) {
             continue;
         }
@@ -197,9 +197,9 @@ async fn run_drift_check(
                 format!("INDEX {}", idx.name),
                 "Index exists in DB but not in migrations".to_string(),
             ),
-            SchemaDiff::IndexDropped(n) => (
+            SchemaDiff::IndexDropped { name, table_name } => (
                 DriftType::MissingObject,
-                format!("INDEX {}", n),
+                format!("INDEX {} ON {}", name, table_name),
                 "Index missing from DB".to_string(),
             ),
             _ => {
@@ -404,9 +404,9 @@ fn diffs_to_drift_entries(diffs: &[SchemaDiff], history_table: &str) -> Vec<Drif
                 format!("INDEX {}", idx.name),
                 "Index exists in DB but not in migrations".to_string(),
             ),
-            SchemaDiff::IndexDropped(n) => (
+            SchemaDiff::IndexDropped { name, table_name } => (
                 DriftType::MissingObject,
-                format!("INDEX {}", n),
+                format!("INDEX {} ON {}", name, table_name),
                 "Index missing from DB".to_string(),
             ),
             other => {

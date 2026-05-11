@@ -21,7 +21,11 @@ use crate::error::Result;
 #[cfg(any(not(feature = "postgres"), not(feature = "mysql")))]
 use crate::error::WaypointError;
 
-/// Complete snapshot of a PostgreSQL schema.
+/// Complete snapshot of a database schema.
+///
+/// Populated by [`introspect`] on PostgreSQL and [`introspect_mysql`] on
+/// MySQL. Concepts that don't apply to MySQL (sequences, PG-style enums,
+/// extensions) come back as empty vectors when produced by `introspect_mysql`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SchemaSnapshot {
     /// All base tables in the schema.
@@ -186,7 +190,11 @@ pub enum SchemaDiff {
     /// An index was added in the target schema.
     IndexAdded(IndexDef),
     /// An index was dropped from the target schema.
-    IndexDropped(String),
+    ///
+    /// Carries both the index name and the table it belongs to — MySQL's
+    /// `DROP INDEX` syntax requires the table (unlike PostgreSQL where
+    /// indexes are schema-scoped).
+    IndexDropped { name: String, table_name: String },
     /// A view was added in the target schema.
     ViewAdded(ViewDef),
     /// A view was dropped from the target schema.
@@ -244,7 +252,9 @@ impl std::fmt::Display for SchemaDiff {
                 write!(f, "~ COLUMN {}.{}", table, column)
             }
             SchemaDiff::IndexAdded(idx) => write!(f, "+ INDEX {}", idx.name),
-            SchemaDiff::IndexDropped(n) => write!(f, "- INDEX {}", n),
+            SchemaDiff::IndexDropped { name, table_name } => {
+                write!(f, "- INDEX {} ON {}", name, table_name)
+            }
             SchemaDiff::ViewAdded(v) => write!(f, "+ VIEW {}", v.name),
             SchemaDiff::ViewDropped(n) => write!(f, "- VIEW {}", n),
             SchemaDiff::ViewAltered { name, .. } => write!(f, "~ VIEW {}", name),
@@ -697,7 +707,10 @@ pub fn diff(before: &SchemaSnapshot, after: &SchemaSnapshot) -> Vec<SchemaDiff> 
     // Indexes: check dropped then added
     for bi in &before.indexes {
         if !after_indexes.contains(bi.name.as_str()) {
-            diffs.push(SchemaDiff::IndexDropped(bi.name.clone()));
+            diffs.push(SchemaDiff::IndexDropped {
+                name: bi.name.clone(),
+                table_name: bi.table_name.clone(),
+            });
         }
     }
     for ai in &after.indexes {
@@ -930,7 +943,8 @@ pub fn generate_ddl(diffs: &[SchemaDiff]) -> String {
             SchemaDiff::IndexAdded(idx) => {
                 statements.push(format!("{};", idx.definition));
             }
-            SchemaDiff::IndexDropped(name) => {
+            SchemaDiff::IndexDropped { name, .. } => {
+                // PG: indexes are schema-scoped, no ON clause needed.
                 statements.push(format!("DROP INDEX IF EXISTS {};", quote_ident(name)));
             }
             SchemaDiff::ViewAdded(v) => {
@@ -1251,15 +1265,9 @@ pub fn generate_ddl_mysql(diffs: &[SchemaDiff]) -> String {
                 // idx.definition is already MySQL-shaped from introspect_mysql.
                 statements.push(format!("{};", idx.definition.trim_end_matches(';')));
             }
-            SchemaDiff::IndexDropped(name) => {
-                // MySQL syntax: DROP INDEX `name` ON `table` — but we don't
-                // carry the table on a Dropped variant. Best-effort: emit a
-                // version with a comment so the user can patch it.
-                statements.push(format!(
-                    "-- TODO: specify table for DROP INDEX {} on MySQL\nDROP INDEX {};",
-                    name,
-                    q(name)
-                ));
+            SchemaDiff::IndexDropped { name, table_name } => {
+                // MySQL requires `DROP INDEX <name> ON <table>`.
+                statements.push(format!("DROP INDEX {} ON {};", q(name), q(table_name)));
             }
             SchemaDiff::ViewAdded(v) => {
                 statements.push(format!(
