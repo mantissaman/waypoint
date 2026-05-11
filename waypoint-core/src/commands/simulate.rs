@@ -309,12 +309,36 @@ async fn run_simulation_mysql(
         }
     }
 
-    // TODO(mysql-views): SHOW CREATE VIEW returns DDL with the source schema
-    // baked into qualified refs. Rewriting it reliably requires real SQL
-    // parsing (not regex). For now we omit views from simulation replication
-    // — migrations that depend on views via SELECT will hit a clear error.
-    // When MySQL schema introspection lands this should consume the same
-    // structural representation as diff/drift.
+    // Replicate views. SHOW CREATE VIEW returns the DDL with `source_db`.
+    // baked into qualified column refs. We rewrite `source_db`. → empty so
+    // the view binds to the current default database (temp_db, since we
+    // USE'd into it above). This handles the common case where a view
+    // references tables in the same database; cross-database views would
+    // need a proper SQL rewriter — those will fail to replicate and the
+    // dependent migration will surface a clear error.
+    let views: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.VIEWS \
+             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
+            (source_db,),
+        )
+        .await?;
+    for view_name in &views {
+        let show_stmt = format!("SHOW CREATE VIEW `{}`.`{}`", source_db, view_name);
+        if let Ok(Some(row)) = conn.query_first::<mysql_async::Row, _>(&show_stmt).await {
+            let mut row = row;
+            if let Some(create_sql) = row.take::<String, _>(1) {
+                let rewritten = rewrite_view_db_qualifier(&create_sql, source_db);
+                if let Err(e) = conn.query_drop(&rewritten).await {
+                    log::debug!(
+                        "Partial replication for view {}: {} (simulation continuing)",
+                        view_name,
+                        e
+                    );
+                }
+            }
+        }
+    }
 
     // Get pending migrations.
     let resolved = scan_migrations(&config.migrations.locations)?;
@@ -379,4 +403,45 @@ async fn run_simulation_mysql(
         temp_schema: temp_db.to_string(),
         errors,
     })
+}
+
+/// Rewrite `\`source_db\`.` prefixes in a view DDL so the view binds to the
+/// current default database when re-executed.
+///
+/// MySQL's `SHOW CREATE VIEW` returns column references qualified with the
+/// source database. When we replay the DDL into a different database, those
+/// qualifiers would still point at the original — so we strip them and let
+/// the current `USE` provide the binding. Simple string-replace; for views
+/// that legitimately reference *other* databases this won't work and the
+/// replay will fail (logged as a debug message, not fatal).
+#[cfg(feature = "mysql")]
+fn rewrite_view_db_qualifier(create_sql: &str, source_db: &str) -> String {
+    let qualifier = format!("`{}`.", source_db);
+    create_sql.replace(&qualifier, "")
+}
+
+#[cfg(all(test, feature = "mysql"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_strips_source_db_prefix() {
+        let sql = "CREATE VIEW `v` AS SELECT `db1`.`t`.`c` FROM `db1`.`t`";
+        let out = rewrite_view_db_qualifier(sql, "db1");
+        assert_eq!(out, "CREATE VIEW `v` AS SELECT `t`.`c` FROM `t`");
+    }
+
+    #[test]
+    fn rewrite_preserves_unrelated_db_prefix() {
+        let sql = "CREATE VIEW `v` AS SELECT `other`.`t`.`c` FROM `other`.`t`";
+        let out = rewrite_view_db_qualifier(sql, "db1");
+        assert_eq!(out, sql);
+    }
+
+    #[test]
+    fn rewrite_handles_no_qualifier() {
+        let sql = "CREATE VIEW `v` AS SELECT 1 AS x";
+        let out = rewrite_view_db_qualifier(sql, "db1");
+        assert_eq!(out, sql);
+    }
 }

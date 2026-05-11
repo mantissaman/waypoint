@@ -5,7 +5,7 @@
 //! New code paths should use [`DbClient`] which abstracts over the configured
 //! backend (PostgreSQL or MySQL).
 
-use crate::dialect::{dialect_for, DatabaseDialect, DialectKind};
+use crate::dialect::{DatabaseDialect, DialectKind};
 use crate::error::{Result, WaypointError};
 
 #[cfg(feature = "postgres")]
@@ -89,11 +89,30 @@ impl DbClient {
         }
     }
 
-    /// Construct the dialect helper for this connection.
-    pub fn dialect(&self) -> Box<dyn DatabaseDialect> {
-        // Both features are conditionally compiled, so this can't fail in practice
-        // when the corresponding feature is enabled.
-        dialect_for(self.dialect_kind()).expect("dialect for active connection feature")
+    /// Borrow the dialect helper for this connection.
+    ///
+    /// Both `PostgresDialect` and `MysqlDialect` are zero-sized, so this returns
+    /// a static reference rather than allocating a new `Box` per call.
+    pub fn dialect(&self) -> &'static dyn DatabaseDialect {
+        #[cfg(feature = "postgres")]
+        static PG: crate::dialect::postgres::PostgresDialect =
+            crate::dialect::postgres::PostgresDialect;
+        #[cfg(feature = "mysql")]
+        static MY: crate::dialect::mysql::MysqlDialect = crate::dialect::mysql::MysqlDialect;
+        match self.dialect_kind() {
+            #[cfg(feature = "postgres")]
+            DialectKind::Postgres => &PG,
+            #[cfg(not(feature = "postgres"))]
+            DialectKind::Postgres => {
+                panic!("PostgreSQL connection without `postgres` feature compiled in")
+            }
+            #[cfg(feature = "mysql")]
+            DialectKind::Mysql => &MY,
+            #[cfg(not(feature = "mysql"))]
+            DialectKind::Mysql => {
+                panic!("MySQL connection without `mysql` feature compiled in")
+            }
+        }
     }
 
     /// Borrow the inner PostgreSQL client. Returns an error if this DbClient

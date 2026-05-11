@@ -9,8 +9,6 @@
 //! Connection-dependent operations live on [`crate::db::DbClient`] which dispatches
 //! based on its variant (Postgres / MySQL).
 
-use crate::error::Result;
-
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
@@ -92,25 +90,6 @@ pub trait DatabaseDialect: Send + Sync {
     /// callers should refuse the `batch_transaction` config or return a clear
     /// error rather than silently no-op.
     fn supports_transactional_ddl(&self) -> bool;
-}
-
-/// Construct the dialect for a given kind. Returns an error if the corresponding
-/// Cargo feature is not enabled.
-pub fn dialect_for(kind: DialectKind) -> Result<Box<dyn DatabaseDialect>> {
-    match kind {
-        #[cfg(feature = "postgres")]
-        DialectKind::Postgres => Ok(Box::new(postgres::PostgresDialect)),
-        #[cfg(not(feature = "postgres"))]
-        DialectKind::Postgres => Err(crate::error::WaypointError::ConfigError(
-            "PostgreSQL support is not compiled in (enable the `postgres` feature)".into(),
-        )),
-        #[cfg(feature = "mysql")]
-        DialectKind::Mysql => Ok(Box::new(mysql::MysqlDialect)),
-        #[cfg(not(feature = "mysql"))]
-        DialectKind::Mysql => Err(crate::error::WaypointError::ConfigError(
-            "MySQL support is not compiled in (enable the `mysql` feature)".into(),
-        )),
-    }
 }
 
 #[cfg(test)]

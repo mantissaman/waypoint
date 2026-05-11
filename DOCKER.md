@@ -1,9 +1,12 @@
 # Waypoint Docker Image
 
-Lightweight PostgreSQL migration tool, distributed as a minimal Docker image (~30MB).
-Drop-in replacement for Flyway containers.
+Lightweight SQL migration tool, distributed as a minimal Docker image (~30MB).
+Supports PostgreSQL 12+ and MySQL 8.0+ (engine auto-detected from the
+connection URL scheme). Drop-in replacement for Flyway containers.
 
 ## Quick Start
+
+PostgreSQL:
 
 ```bash
 docker run --rm \
@@ -13,6 +16,15 @@ docker run --rm \
   -e DB_NAME=mydb \
   -e DB_USERNAME=postgres \
   -e DB_PASSWORD=secret \
+  tensorbeeio/waypoint
+```
+
+MySQL 8.0+ (pass the full URL so the `mysql://` scheme triggers the MySQL backend):
+
+```bash
+docker run --rm \
+  -v ./db/migrations:/waypoint/sql \
+  -e WAYPOINT_DATABASE_URL="mysql://user:pass@host.docker.internal:3306/mydb" \
   tensorbeeio/waypoint
 ```
 

@@ -1401,6 +1401,32 @@ async fn run_migrate_mysql(
 
     history::create_history_table_db(client, &schema, table).await?;
 
+    // Validate-on-migrate parity with PG: if enabled, run validation first.
+    if config.migrations.validate_on_migrate {
+        if let Err(e) = super::validate::execute_db(client, config).await {
+            match &e {
+                WaypointError::ValidationFailed(_) => return Err(e),
+                _ => log::debug!("Validation skipped: {}", e),
+            }
+        }
+    }
+
+    // Preflight checks parity with PG: if enabled, run them and abort on Fail.
+    if config.preflight.enabled {
+        let report = crate::preflight::run_preflight_db(client, &config.preflight).await?;
+        if !report.passed {
+            let failed_checks: Vec<String> = report
+                .checks
+                .iter()
+                .filter(|c| c.status == crate::preflight::CheckStatus::Fail)
+                .map(|c| format!("{}: {}", c.name, c.detail))
+                .collect();
+            return Err(WaypointError::PreflightFailed {
+                checks: failed_checks.join("; "),
+            });
+        }
+    }
+
     let resolved = scan_migrations(&config.migrations.locations)?;
     let applied = history::get_applied_migrations_db(client, &schema, table).await?;
 

@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — MySQL 8.0+ support (opt-in via `mysql` Cargo feature)
+
+Engine auto-detected from the connection URL scheme (`mysql://` → MySQL,
+`postgres://` / `postgresql://` → PostgreSQL). Existing PostgreSQL users see
+zero changes — the `postgres` feature is on by default.
+
+**Commands working end-to-end on MySQL 8.0+:**
+
+- `migrate` — with hooks (beforeMigrate, beforeEachMigrate, afterEachMigrate, afterMigrate), validate-on-migrate, preflight gating, and environment scoping. Refuses `batch_transaction = true` with a clear error since MySQL DDL is non-transactional.
+- `info`, `validate`, `repair`, `baseline` — full parity with PostgreSQL using the dialect-aware `_db` entry points.
+- `clean` — drops views, base tables, routines, and events; uses `FOREIGN_KEY_CHECKS = 0` so drop order doesn't matter.
+- `snapshot` / `restore` — backed by `SHOW CREATE TABLE` / `SHOW CREATE VIEW` rather than full schema introspection.
+- `undo` — supports manual `U{version}__*.sql` files. Auto-reversal generation remains PostgreSQL-only until MySQL schema introspection lands.
+- `preflight` — 6 MySQL-specific checks: `@@read_only` / `@@super_read_only`, threads-connected vs `@@max_connections`, long-running queries from `information_schema.PROCESSLIST`, `Seconds_Behind_Source` from `SHOW REPLICA STATUS`, database size from `information_schema.TABLES`, pending metadata locks from `performance_schema.metadata_locks`.
+- `simulate` — replicates source structure into a throwaway database via `SHOW CREATE TABLE` and `SHOW CREATE VIEW` (with `\`source_db\`.` qualifier stripped so views bind to the temp database).
+- `lint`, `changelog`, `check-conflicts` — already engine-agnostic (no DB required).
+
+**Architecture:**
+
+- `dialect/` module with `DatabaseDialect` trait + `DialectKind` enum + `PostgresDialect` / `MysqlDialect` impls. Pure (no-DB) per-engine knobs: identifier quoting, history-table DDL, transactional-DDL capability.
+- `DbClient` enum wraps `tokio_postgres::Client` or `mysql_async::Pool`. Dialect-aware methods on `DbClient`: `acquire_lock`, `release_lock`, `current_user`, `current_database`, `resolve_schema`, `execute_raw`, `execute_in_transaction`.
+- "Schema" fallback: when the configured schema is the PG default `"public"`, MySQL paths fall back to `DATABASE()` so a PG-shaped config keeps working when pointed at MySQL.
+- Most ported commands keep a paired `execute(&Client, ...)` (PG legacy) + `execute_db(&DbClient, ...)` (dialect-aware) entry. Legacy entries serve internal callers in `multi.rs`, `explain.rs`, and the PG-specific helpers in `migrate.rs`.
+
+**Configuration:**
+
+- New `[preflight] max_replication_lag_secs` (default 30) — MySQL replica-lag threshold. Existing `max_replication_lag_mb` (default 100) remains PostgreSQL-only.
+- New `mysql` Cargo feature on both `waypoint-core` and `waypoint-cli`. Build with `--features mysql` to opt in.
+
+**Not yet ported to MySQL (deferred):**
+
+- `guards` (`require` / `ensure`) — builtin functions use `pg_catalog`; need an `information_schema` port.
+- `auto-reversal generation`, `diff`, `drift` — need a parallel MySQL schema-introspection module.
+- `safety` analysis — PostgreSQL lock-level mapping is engine-specific; MySQL needs `ALGORITHM=INSTANT/INPLACE/COPY` rules.
+- `advisor` — `A001`–`A010` rules are PG-shaped; need a parallel MySQL rule set.
+- `explain` — EXPLAIN output format differs significantly.
+
+See `CLAUDE.md` for the full per-command status table.
+
 ## [0.3.0] - 2026-02-20
 
 ### Added

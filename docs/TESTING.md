@@ -5,17 +5,21 @@ Step-by-step instructions to manually test every waypoint feature using the prov
 ## Prerequisites
 
 ```bash
-# Build waypoint
+# Build waypoint (PostgreSQL only — default)
 cargo build
+
+# Or build with MySQL support as well
+cargo build --features mysql
 
 # Alias for convenience (or use cargo run --)
 alias wp="cargo run --quiet --"
 ```
 
-For features that need a database, start PostgreSQL and create a test database:
+For features that need a database, start a server and create a test database:
+
+### PostgreSQL
 
 ```bash
-# Start PostgreSQL (adjust for your setup)
 # Option A: Docker
 docker run -d --name wp-test-pg \
   -e POSTGRES_USER=postgres \
@@ -25,12 +29,41 @@ docker run -d --name wp-test-pg \
   postgres:16
 
 # Option B: Use an existing PostgreSQL instance
-# Just create the test database:
 createdb waypoint_test
 
-# Set the URL (used throughout this guide)
+# Set the URL (used throughout this guide for PG examples)
 export DB_URL="postgres://postgres:postgres@localhost:5432/waypoint_test"
 ```
+
+### MySQL 8.0+
+
+```bash
+# Option A: Docker
+docker run -d --name wp-test-mysql \
+  -e MYSQL_ROOT_PASSWORD=mysql \
+  -e MYSQL_DATABASE=waypoint_test \
+  -p 3306:3306 \
+  mysql:8.4
+
+# Set the URL for MySQL-flavored tests
+export DB_URL_MYSQL="mysql://root:mysql@localhost:3306/waypoint_test"
+```
+
+Commands work the same on both engines — just point `--url` at the right one.
+Most analysis commands (`safety`, `advise`, `diff`, `drift`, guards) are
+PostgreSQL-only for now; see [CLAUDE.md](../CLAUDE.md) for the per-command
+status table.
+
+### Running the MySQL integration test suite
+
+```bash
+# Defaults to mysql://root:mysql@127.0.0.1:13306/mysql; override with TEST_MYSQL_URL
+cargo test --features mysql --test mysql_integration_test
+```
+
+The suite is fully self-contained: each test creates and drops a uniquely-named
+database (`waypoint_test_<prefix>_<n>`) so it never collides with another test
+or your local data.
 
 ---
 

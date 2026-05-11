@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build                                              # Build both crates (default: postgres feature)
 cargo build --features mysql                             # Build with MySQL backend
 cargo test --lib                                         # Unit tests (postgres only, 261 tests)
-cargo test --features mysql --lib                        # Unit tests with both backends (264 tests)
+cargo test --features mysql --lib                        # Unit tests with both backends (267 tests)
 cargo test --features mysql --test mysql_integration_test  # MySQL integration tests (18 tests, needs container)
 cargo test                                               # Integration tests need TEST_DATABASE_URL (PG)
 cargo clippy --features mysql --all-targets -- -D warnings  # Lint (use --features mysql to cover both paths)
@@ -71,7 +71,7 @@ No-DB commands (pure file analysis): `lint`, `changelog`, `check_conflicts` — 
 
 | Command | Status | Notes |
 |---|---|---|
-| `migrate` | ✅ working | Skips guards/safety/reversals; no batch-transaction (MySQL DDL auto-commits) |
+| `migrate` | ✅ working | Includes hooks + validate-on-migrate + preflight. Skips guards/safety/reversals. Errors on `batch_transaction = true` (MySQL DDL auto-commits, so no atomic rollback) |
 | `info` | ✅ working | Dialect-aware via `execute_db` |
 | `validate` | ✅ working | Checksum check; same Flyway-compat CRC32 |
 | `repair` | ✅ working | Drops failed rows; updates checksums |
@@ -81,7 +81,7 @@ No-DB commands (pure file analysis): `lint`, `changelog`, `check_conflicts` — 
 | `restore` | ✅ working | Wipes target DB, replays snapshot via MySQL-aware splitter |
 | `undo` | ✅ working | Manual U-files only — auto-reversal still PG-specific |
 | `preflight` | ✅ working | 6 MySQL-specific checks: read-only, connections, processlist, replica lag, db size, metadata locks |
-| `simulate` | ✅ working | Replicates source DDL into a temp database via SHOW CREATE, runs pendings, drops temp DB |
+| `simulate` | ✅ working | Replicates source DDL (tables + views) into a temp database via SHOW CREATE, runs pendings, drops temp DB. View qualifiers rewritten so refs bind to the temp database |
 | `lint` / `changelog` / `check-conflicts` | ✅ working | No-DB; engine-agnostic |
 | `guards` (require / ensure) | ⚠️ PG only | guard.rs builtin functions use pg_catalog; need MySQL information_schema port |
 | `auto-reversal generation` | ⚠️ PG only | Depends on full schema diff; deferred with diff/drift |
