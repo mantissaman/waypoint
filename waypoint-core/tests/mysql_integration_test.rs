@@ -1122,6 +1122,66 @@ async fn drift_detects_manual_schema_change() {
 }
 
 #[tokio::test]
+async fn restore_handles_foreign_keys_across_dependency_order() {
+    use waypoint_core::commands::snapshot::SnapshotConfig;
+    // Regression: SHOW CREATE TABLE returns tables in alphabetical order, not
+    // foreign-key-dependency order. If FOREIGN_KEY_CHECKS=1 during the restore
+    // apply, a CREATE TABLE with a forward FK reference fails with error 1822.
+    // The fix keeps FK_CHECKS=0 throughout the apply and re-enables at the end.
+    let db = fresh_database("fkrestore").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    // `orders` references `users` — and "orders" sorts BEFORE "users"
+    // alphabetically, so the snapshot will emit the CREATE TABLE for orders
+    // first.
+    write_migrations(
+        &migrations,
+        &[(
+            "V1__Schema.sql",
+            "CREATE TABLE users (id INT PRIMARY KEY); \
+                 CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, \
+                   FOREIGN KEY (user_id) REFERENCES users (id));",
+        )],
+    );
+    let mut config = config_for(name, migrations);
+    config.migrations.clean_enabled = true;
+    let wp = Waypoint::new(config).await.expect("connect");
+    wp.migrate(None).await.expect("migrate");
+
+    let snap_dir = tempfile::tempdir().unwrap();
+    let snap_config = SnapshotConfig {
+        directory: snap_dir.path().to_path_buf(),
+        auto_snapshot_on_migrate: false,
+        max_snapshots: 10,
+    };
+    let report = wp.snapshot(&snap_config).await.expect("snapshot");
+
+    wp.clean(true).await.expect("clean");
+
+    // The restore must succeed even though `orders` is created before `users`
+    // in the snapshot. Pre-fix this would have errored with 1822 (table
+    // doesn't exist) on the orders CREATE TABLE.
+    wp.restore(&snap_config, &report.snapshot_id)
+        .await
+        .expect("restore should handle FK forward-reference");
+
+    let pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
+    let mut conn = pool.get_conn().await.unwrap();
+    let tables: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' \
+             ORDER BY TABLE_NAME",
+            (name,),
+        )
+        .await
+        .unwrap();
+    assert!(tables.contains(&"orders".to_string()));
+    assert!(tables.contains(&"users".to_string()));
+}
+
+#[tokio::test]
 async fn migrate_with_options_routes_to_mysql_path() {
     // Regression: the CLI's Migrate handler historically called
     // `migrate::execute_with_options(wp.postgres_client()?, ..., force)` to

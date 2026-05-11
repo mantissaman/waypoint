@@ -447,7 +447,13 @@ async fn execute_restore_mysql(
         let s = format!("DROP TABLE IF EXISTS `{}`.`{}`", schema_name, t);
         conn.query_drop(&s).await?;
     }
-    conn.query_drop("SET FOREIGN_KEY_CHECKS = 1").await?;
+    // Keep FOREIGN_KEY_CHECKS=0 across the apply phase too: MySQL validates
+    // FK references at CREATE TABLE time (error 1822 when the referenced
+    // table doesn't exist yet), and snapshots are written in alphabetical
+    // order, not FK-dependency order. With FK checks off, MySQL records the
+    // constraint without validating that the referenced table exists yet,
+    // and forward references resolve once the referenced table is created.
+    // We restore FK checks at the end.
 
     // Apply snapshot. The snapshot is a series of SHOW CREATE TABLE outputs,
     // each terminated with `;`. We use a MySQL-aware splitter that respects
@@ -472,6 +478,16 @@ async fn execute_restore_mysql(
                 );
             }
         }
+    }
+
+    // Restore FK checks for subsequent operations on this connection. If this
+    // fails, log but don't surface — the snapshot apply already succeeded and
+    // the connection is short-lived (returns to the pool on drop).
+    if let Err(e) = conn.query_drop("SET FOREIGN_KEY_CHECKS = 1").await {
+        log::warn!(
+            "Failed to restore FOREIGN_KEY_CHECKS=1 on restore conn: {}",
+            e
+        );
     }
 
     Ok(RestoreReport {
