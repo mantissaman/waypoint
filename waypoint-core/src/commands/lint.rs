@@ -113,20 +113,18 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                 DdlOperation::CreateTable {
                     table,
                     if_not_exists,
-                } if !if_not_exists => {
-                    if !disabled.contains("W001") {
-                        issues.push(LintIssue {
-                            rule_id: "W001".to_string(),
-                            severity: LintSeverity::Warning,
-                            message: format!("CREATE TABLE {} without IF NOT EXISTS", table),
-                            script: script.clone(),
-                            line: find_line(sql, &upper, "CREATE TABLE"),
-                            suggestion: Some(
-                                "Use CREATE TABLE IF NOT EXISTS to make migration re-runnable"
-                                    .to_string(),
-                            ),
-                        });
-                    }
+                } if !if_not_exists && !disabled.contains("W001") => {
+                    issues.push(LintIssue {
+                        rule_id: "W001".to_string(),
+                        severity: LintSeverity::Warning,
+                        message: format!("CREATE TABLE {} without IF NOT EXISTS", table),
+                        script: script.clone(),
+                        line: find_line(sql, &upper, "CREATE TABLE"),
+                        suggestion: Some(
+                            "Use CREATE TABLE IF NOT EXISTS to make migration re-runnable"
+                                .to_string(),
+                        ),
+                    });
                 }
 
                 // W002: CREATE INDEX without CONCURRENTLY
@@ -134,20 +132,20 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                     name,
                     is_concurrent,
                     ..
-                } if !is_concurrent => {
-                    if !disabled.contains("W002") {
-                        issues.push(LintIssue {
-                            rule_id: "W002".to_string(),
-                            severity: LintSeverity::Warning,
-                            message: format!(
-                                "CREATE INDEX {} without CONCURRENTLY (blocks writes during creation)",
-                                name
-                            ),
-                            script: script.clone(),
-                            line: find_line(sql, &upper, "CREATE INDEX"),
-                            suggestion: Some("Use CREATE INDEX CONCURRENTLY to avoid blocking writes".to_string()),
-                        });
-                    }
+                } if !is_concurrent && !disabled.contains("W002") => {
+                    issues.push(LintIssue {
+                        rule_id: "W002".to_string(),
+                        severity: LintSeverity::Warning,
+                        message: format!(
+                            "CREATE INDEX {} without CONCURRENTLY (blocks writes during creation)",
+                            name
+                        ),
+                        script: script.clone(),
+                        line: find_line(sql, &upper, "CREATE INDEX"),
+                        suggestion: Some(
+                            "Use CREATE INDEX CONCURRENTLY to avoid blocking writes".to_string(),
+                        ),
+                    });
                 }
 
                 // E001: ADD COLUMN NOT NULL without DEFAULT
@@ -157,76 +155,65 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                     is_not_null,
                     has_default,
                     ..
-                } if *is_not_null && !has_default => {
-                    if !disabled.contains("E001") {
-                        issues.push(LintIssue {
-                            rule_id: "E001".to_string(),
-                            severity: LintSeverity::Error,
-                            message: format!(
-                                "ADD COLUMN {}.{} is NOT NULL without DEFAULT (will fail if table has rows)",
-                                table, column
-                            ),
-                            script: script.clone(),
-                            line: find_line(sql, &upper, "ADD"),
-                            suggestion: Some("Add a DEFAULT value or make the column nullable".to_string()),
-                        });
-                    }
+                } if *is_not_null && !has_default && !disabled.contains("E001") => {
+                    issues.push(LintIssue {
+                        rule_id: "E001".to_string(),
+                        severity: LintSeverity::Error,
+                        message: format!(
+                            "ADD COLUMN {}.{} is NOT NULL without DEFAULT (will fail if table has rows)",
+                            table, column
+                        ),
+                        script: script.clone(),
+                        line: find_line(sql, &upper, "ADD"),
+                        suggestion: Some("Add a DEFAULT value or make the column nullable".to_string()),
+                    });
                 }
 
                 // W003: ALTER COLUMN TYPE (full table rewrite + lock)
-                DdlOperation::AlterTableAlterColumn { table, column } => {
-                    if !disabled.contains("W003") {
-                        // Check if it's a TYPE change (uses pre-computed uppercase)
-                        if upper.contains("TYPE") {
-                            issues.push(LintIssue {
-                                rule_id: "W003".to_string(),
-                                severity: LintSeverity::Warning,
-                                message: format!(
-                                    "ALTER COLUMN {}.{} TYPE causes full table rewrite and exclusive lock",
-                                    table, column
-                                ),
-                                script: script.clone(),
-                                line: find_line(sql, &upper, "ALTER COLUMN"),
-                                suggestion: Some("Consider a multi-step approach: add new column, backfill, swap".to_string()),
-                            });
-                        }
+                DdlOperation::AlterTableAlterColumn { table, column }
+                    if !disabled.contains("W003") =>
+                {
+                    // Check if it's a TYPE change (uses pre-computed uppercase)
+                    if upper.contains("TYPE") {
+                        issues.push(LintIssue {
+                            rule_id: "W003".to_string(),
+                            severity: LintSeverity::Warning,
+                            message: format!(
+                                "ALTER COLUMN {}.{} TYPE causes full table rewrite and exclusive lock",
+                                table, column
+                            ),
+                            script: script.clone(),
+                            line: find_line(sql, &upper, "ALTER COLUMN"),
+                            suggestion: Some("Consider a multi-step approach: add new column, backfill, swap".to_string()),
+                        });
                     }
                 }
 
                 // W004: DROP TABLE / DROP COLUMN (destructive)
-                DdlOperation::DropTable { table } => {
-                    if !disabled.contains("W004") {
-                        issues.push(LintIssue {
-                            rule_id: "W004".to_string(),
-                            severity: LintSeverity::Warning,
-                            message: format!(
-                                "DROP TABLE {} is destructive and irreversible",
-                                table
-                            ),
-                            script: script.clone(),
-                            line: find_line(sql, &upper, "DROP TABLE"),
-                            suggestion: Some(
-                                "Ensure you have a backup or undo migration".to_string(),
-                            ),
-                        });
-                    }
+                DdlOperation::DropTable { table } if !disabled.contains("W004") => {
+                    issues.push(LintIssue {
+                        rule_id: "W004".to_string(),
+                        severity: LintSeverity::Warning,
+                        message: format!("DROP TABLE {} is destructive and irreversible", table),
+                        script: script.clone(),
+                        line: find_line(sql, &upper, "DROP TABLE"),
+                        suggestion: Some("Ensure you have a backup or undo migration".to_string()),
+                    });
                 }
-                DdlOperation::AlterTableDropColumn { table, column } => {
-                    if !disabled.contains("W004") {
-                        issues.push(LintIssue {
-                            rule_id: "W004".to_string(),
-                            severity: LintSeverity::Warning,
-                            message: format!(
-                                "DROP COLUMN {}.{} is destructive and irreversible",
-                                table, column
-                            ),
-                            script: script.clone(),
-                            line: find_line(sql, &upper, "DROP COLUMN"),
-                            suggestion: Some(
-                                "Ensure you have a backup or undo migration".to_string(),
-                            ),
-                        });
-                    }
+                DdlOperation::AlterTableDropColumn { table, column }
+                    if !disabled.contains("W004") =>
+                {
+                    issues.push(LintIssue {
+                        rule_id: "W004".to_string(),
+                        severity: LintSeverity::Warning,
+                        message: format!(
+                            "DROP COLUMN {}.{} is destructive and irreversible",
+                            table, column
+                        ),
+                        script: script.clone(),
+                        line: find_line(sql, &upper, "DROP COLUMN"),
+                        suggestion: Some("Ensure you have a backup or undo migration".to_string()),
+                    });
                 }
 
                 // W006: Large DEFAULT expression on ADD COLUMN
@@ -235,44 +222,43 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                     column,
                     has_default,
                     ..
-                } if *has_default => {
-                    if !disabled.contains("W006") {
-                        // Heuristic: check for function calls in DEFAULT (uses pre-computed uppercase)
-                        if upper.contains("DEFAULT")
-                            && (upper.contains("RANDOM()")
-                                || upper.contains("GEN_RANDOM_UUID()")
-                                || upper.contains("NOW()"))
-                        {
-                            issues.push(LintIssue {
-                                rule_id: "W006".to_string(),
-                                severity: LintSeverity::Warning,
-                                message: format!(
-                                    "ADD COLUMN {}.{} with volatile DEFAULT expression (pre-PG11: table rewrite)",
-                                    table, column
-                                ),
-                                script: script.clone(),
-                                line: find_line(sql, &upper, "DEFAULT"),
-                                suggestion: Some("On PostgreSQL < 11, volatile defaults cause a full table rewrite".to_string()),
-                            });
-                        }
+                } if *has_default && !disabled.contains("W006") => {
+                    // Heuristic: check for function calls in DEFAULT (uses pre-computed uppercase)
+                    if upper.contains("DEFAULT")
+                        && (upper.contains("RANDOM()")
+                            || upper.contains("GEN_RANDOM_UUID()")
+                            || upper.contains("NOW()"))
+                    {
+                        issues.push(LintIssue {
+                            rule_id: "W006".to_string(),
+                            severity: LintSeverity::Warning,
+                            message: format!(
+                                "ADD COLUMN {}.{} with volatile DEFAULT expression (pre-PG11: table rewrite)",
+                                table, column
+                            ),
+                            script: script.clone(),
+                            line: find_line(sql, &upper, "DEFAULT"),
+                            suggestion: Some("On PostgreSQL < 11, volatile defaults cause a full table rewrite".to_string()),
+                        });
                     }
                 }
 
                 // W007: TRUNCATE TABLE
-                DdlOperation::TruncateTable { table } => {
-                    if !disabled.contains("W007") {
-                        issues.push(LintIssue {
-                            rule_id: "W007".to_string(),
-                            severity: LintSeverity::Warning,
-                            message: format!(
-                                "TRUNCATE TABLE {} is destructive and acquires ACCESS EXCLUSIVE lock",
-                                table
-                            ),
-                            script: script.clone(),
-                            line: find_line(sql, &upper, "TRUNCATE"),
-                            suggestion: Some("Ensure this is intentional and the table can be locked exclusively".to_string()),
-                        });
-                    }
+                DdlOperation::TruncateTable { table } if !disabled.contains("W007") => {
+                    issues.push(LintIssue {
+                        rule_id: "W007".to_string(),
+                        severity: LintSeverity::Warning,
+                        message: format!(
+                            "TRUNCATE TABLE {} is destructive and acquires ACCESS EXCLUSIVE lock",
+                            table
+                        ),
+                        script: script.clone(),
+                        line: find_line(sql, &upper, "TRUNCATE"),
+                        suggestion: Some(
+                            "Ensure this is intentional and the table can be locked exclusively"
+                                .to_string(),
+                        ),
+                    });
                 }
 
                 _ => {}

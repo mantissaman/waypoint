@@ -1191,11 +1191,7 @@ pub fn generate_ddl_mysql(diffs: &[SchemaDiff]) -> String {
             | SchemaDiff::TriggerDropped { table, .. }
             | SchemaDiff::IndexDropped {
                 table_name: table, ..
-            } => {
-                if references_dropped_table(table) {
-                    continue;
-                }
-            }
+            } if references_dropped_table(table) => continue,
             SchemaDiff::ConstraintAdded(c) if references_dropped_table(&c.table_name) => continue,
             SchemaDiff::TriggerAdded(t) if references_dropped_table(&t.table_name) => continue,
             SchemaDiff::IndexAdded(i) if references_dropped_table(&i.table_name) => continue,
