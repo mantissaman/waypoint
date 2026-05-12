@@ -169,24 +169,27 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                     });
                 }
 
-                // W003: ALTER COLUMN TYPE (full table rewrite + lock)
+                // W003: ALTER COLUMN TYPE (full table rewrite + lock).
+                // The `upper.contains("TYPE")` guard distinguishes a TYPE
+                // change from other ALTER COLUMN forms (SET DEFAULT, SET NOT
+                // NULL, etc.) which don't trigger a rewrite.
                 DdlOperation::AlterTableAlterColumn { table, column }
-                    if !disabled.contains("W003") =>
+                    if !disabled.contains("W003") && upper.contains("TYPE") =>
                 {
-                    // Check if it's a TYPE change (uses pre-computed uppercase)
-                    if upper.contains("TYPE") {
-                        issues.push(LintIssue {
-                            rule_id: "W003".to_string(),
-                            severity: LintSeverity::Warning,
-                            message: format!(
-                                "ALTER COLUMN {}.{} TYPE causes full table rewrite and exclusive lock",
-                                table, column
-                            ),
-                            script: script.clone(),
-                            line: find_line(sql, &upper, "ALTER COLUMN"),
-                            suggestion: Some("Consider a multi-step approach: add new column, backfill, swap".to_string()),
-                        });
-                    }
+                    issues.push(LintIssue {
+                        rule_id: "W003".to_string(),
+                        severity: LintSeverity::Warning,
+                        message: format!(
+                            "ALTER COLUMN {}.{} TYPE causes full table rewrite and exclusive lock",
+                            table, column
+                        ),
+                        script: script.clone(),
+                        line: find_line(sql, &upper, "ALTER COLUMN"),
+                        suggestion: Some(
+                            "Consider a multi-step approach: add new column, backfill, swap"
+                                .to_string(),
+                        ),
+                    });
                 }
 
                 // W004: DROP TABLE / DROP COLUMN (destructive)
@@ -216,31 +219,33 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                     });
                 }
 
-                // W006: Large DEFAULT expression on ADD COLUMN
+                // W006: Volatile DEFAULT expression on ADD COLUMN. The
+                // upper.contains(...) guards narrow this to ADD COLUMNs whose
+                // DEFAULT calls a volatile function (RANDOM/GEN_RANDOM_UUID/
+                // NOW) — pre-PG11 those force a full table rewrite.
                 DdlOperation::AlterTableAddColumn {
                     table,
                     column,
                     has_default,
                     ..
-                } if *has_default && !disabled.contains("W006") => {
-                    // Heuristic: check for function calls in DEFAULT (uses pre-computed uppercase)
-                    if upper.contains("DEFAULT")
-                        && (upper.contains("RANDOM()")
-                            || upper.contains("GEN_RANDOM_UUID()")
-                            || upper.contains("NOW()"))
-                    {
-                        issues.push(LintIssue {
-                            rule_id: "W006".to_string(),
-                            severity: LintSeverity::Warning,
-                            message: format!(
-                                "ADD COLUMN {}.{} with volatile DEFAULT expression (pre-PG11: table rewrite)",
-                                table, column
-                            ),
-                            script: script.clone(),
-                            line: find_line(sql, &upper, "DEFAULT"),
-                            suggestion: Some("On PostgreSQL < 11, volatile defaults cause a full table rewrite".to_string()),
-                        });
-                    }
+                } if *has_default
+                    && !disabled.contains("W006")
+                    && upper.contains("DEFAULT")
+                    && (upper.contains("RANDOM()")
+                        || upper.contains("GEN_RANDOM_UUID()")
+                        || upper.contains("NOW()")) =>
+                {
+                    issues.push(LintIssue {
+                        rule_id: "W006".to_string(),
+                        severity: LintSeverity::Warning,
+                        message: format!(
+                            "ADD COLUMN {}.{} with volatile DEFAULT expression (pre-PG11: table rewrite)",
+                            table, column
+                        ),
+                        script: script.clone(),
+                        line: find_line(sql, &upper, "DEFAULT"),
+                        suggestion: Some("On PostgreSQL < 11, volatile defaults cause a full table rewrite".to_string()),
+                    });
                 }
 
                 // W007: TRUNCATE TABLE
